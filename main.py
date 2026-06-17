@@ -31,6 +31,21 @@ def clean_and_parse_json(text):
             cleaned = match.group(1).strip()
 
     return json.loads(cleaned)
+def call_grok_json(system_prompt, user_content):
+    client = get_grok_client()
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content}
+        ],
+        temperature=0.2
+    )
+
+    return clean_and_parse_json(
+        response.choices[0].message.content
+    )
 # ---------------- BASIC ROUTES ----------------
 @app.get("/")
 def home():
