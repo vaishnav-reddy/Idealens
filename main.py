@@ -1,14 +1,20 @@
-from fastapi import FastAPI
-import requests
+import os
+import re
 import json
-from duckduckgo_search import DDGS
-from bs4 import BeautifulSoup
+import requests
 
-app = FastAPI()
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+
+app = FastAPI(title="IdeaLens API", version="1.0.0")
+
+class AnalyzeRequest(BaseModel):
+    idea: str
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
 
+# ---------------- LLM CALL ----------------
 def call_ollama(prompt):
     response = requests.post(
         OLLAMA_URL,
@@ -21,6 +27,7 @@ def call_ollama(prompt):
     return response.json()["response"]
 
 
+# ---------------- BASIC ROUTES ----------------
 @app.get("/")
 def home():
     return {"message": "IdeaLens Backend Running"}
@@ -32,16 +39,9 @@ def test_llm():
     result = call_ollama(prompt)
     return {"response": result}
 
-from fastapi import Body
 
-
-
-
-
-@app.post("/parse-idea")
-def parse_idea(data: dict = Body(...)):
-    user_input = data.get("idea")
-
+# ---------------- IDEA PARSER ----------------
+def parse_idea_internal(user_input):
     prompt = f"""
 You are an AI system that extracts structured information.
 
@@ -72,18 +72,17 @@ ONLY JSON.
     result = call_ollama(prompt)
 
     try:
-        parsed_json = json.loads(result)
+        return json.loads(result)
     except:
-        return {
-            "error": "Invalid JSON from model",
-            "raw_output": result
-        }
-
-    return {"parsed_idea": parsed_json}
+        return {"error": "Invalid JSON", "raw": result}
 
 
-#  Search function 
+@app.post("/parse-idea")
+def parse_idea(data: dict = Body(...)):
+    return {"parsed_idea": parse_idea_internal(data.get("idea"))}
 
+
+# ---------------- SEARCH ----------------
 def search_duckduckgo(query):
     results = []
 
@@ -98,25 +97,35 @@ def search_duckduckgo(query):
     return results
 
 
-# Fetch website content
-
+# ---------------- FETCH WEBSITE ----------------
 def fetch_website_content(url):
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
-        response = requests.get(url, headers=headers, timeout=5)
+        response = requests.get(url, headers=headers, timeout=10)
 
         soup = BeautifulSoup(response.text, "html.parser")
 
-        paragraphs = soup.find_all("p")
-        text = " ".join([p.get_text() for p in paragraphs[:5]])
+        text = soup.get_text(separator=" ", strip=True)
 
-        return text
+        return text[:2000]
 
-    except:
+    except Exception as e:
+        print("Error fetching:", url, e)
         return ""
-    
 
- # Wesite understanding agent 
+
+# ---------------- ANALYZE WEBSITE ----------------
+def extract_json(text):
+    try:
+        # Find JSON inside text using regex
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        else:
+            return {"error": "No JSON found", "raw": text}
+    except:
+        return {"error": "Invalid JSON", "raw": text}
+
 
 def analyze_website(content):
     prompt = f"""
@@ -127,10 +136,14 @@ Extract:
 - what it does
 - key features
 
+IMPORTANT:
+Return ONLY JSON.
+No explanation.
+
 Content:
 {content}
 
-Return ONLY JSON:
+Format:
 {{
   "name": "",
   "description": "",
@@ -140,30 +153,33 @@ Return ONLY JSON:
 
     result = call_ollama(prompt)
 
-    try:
-        return json.loads(result)
-    except:
-        return {"error": "Invalid response", "raw": result}
-    
-## Main End Points
+    return extract_json(result)
+    print("QUERY:", query)
+    print("SEARCH RESULTS:", results)
 
+
+# ---------------- MAIN PIPELINE ----------------
 @app.post("/analyze-idea")
 def analyze_idea(data: dict = Body(...)):
     idea = data.get("idea")
 
     # Step 1: Parse idea
-    parsed = parse_idea({"idea": idea})["parsed_idea"]
+    parsed = parse_idea_internal(idea)
 
-    # Step 2: Build search query
-    query = f"{parsed['solution']} {parsed['domain']} startup"
+    # Step 2: Search query
+    query = f"{parsed['solution']} {parsed['domain']} startup OR app OR platform"
 
     # Step 3: Search
     results = search_duckduckgo(query)
 
     analyzed_results = []
 
+    # Step 4: Process each result
     for r in results[:3]:
+        print("URL:", r["url"])
+
         content = fetch_website_content(r["url"])
+        print("Content length:", len(content))
 
         if content:
             analysis = analyze_website(content)
@@ -172,6 +188,14 @@ def analyze_idea(data: dict = Body(...)):
                 "url": r["url"],
                 "analysis": analysis
             })
+
+    # Step 5: Fallback
+    if not analyzed_results:
+        return {
+            "parsed_idea": parsed,
+            "message": "No detailed analysis found",
+            "search_results": results
+        }
 
     return {
         "parsed_idea": parsed,
