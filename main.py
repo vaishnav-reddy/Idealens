@@ -17,6 +17,20 @@ def get_grok_client():
         base_url="https://api.groq.com/openai/v1"
     )
 
+def clean_and_parse_json(text):
+    cleaned = text.strip()
+
+    if cleaned.startswith("```"):
+        match = re.search(
+            r"^(?:```(?:json)?\n)?(.*?)(?:\n```)?$",
+            cleaned,
+            re.DOTALL
+        )
+
+        if match:
+            cleaned = match.group(1).strip()
+
+    return json.loads(cleaned)
 # ---------------- BASIC ROUTES ----------------
 @app.get("/")
 def home():
