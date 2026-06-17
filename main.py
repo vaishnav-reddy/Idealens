@@ -46,6 +46,19 @@ def call_grok_json(system_prompt, user_content):
     return clean_and_parse_json(
         response.choices[0].message.content
     )
+def search_competitors(query):
+    from tavily import TavilyClient
+
+    tavily_client = TavilyClient(
+        api_key=os.getenv("TAVILY_API_KEY")
+    )
+
+    response = tavily_client.search(
+        query=query,
+        max_results=5
+    )
+
+    return response.get("results", [])
 # ---------------- BASIC ROUTES ----------------
 @app.get("/")
 def home():
