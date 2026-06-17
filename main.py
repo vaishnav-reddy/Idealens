@@ -59,6 +59,19 @@ def search_competitors(query):
     )
 
     return response.get("results", [])
+def fetch_and_analyze_competitor(
+    url,
+    title
+):
+    jina_url = f"https://r.jina.ai/{url}"
+
+    res = requests.get(
+        jina_url,
+        timeout=15
+    )
+ 
+
+    
 # ---------------- BASIC ROUTES ----------------
 @app.get("/")
 def home():
