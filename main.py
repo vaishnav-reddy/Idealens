@@ -1,31 +1,21 @@
-import os
-import re
-import json
-import requests
+from dotenv import load_dotenv
+from openai import OpenAI
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+load_dotenv()
 
-app = FastAPI(title="IdeaLens API", version="1.0.0")
+def get_grok_client():
+    api_key = os.getenv("GROK_API_KEY")
 
-class AnalyzeRequest(BaseModel):
-    idea: str
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="GROK_API_KEY environment variable is not set."
+        )
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-
-
-# ---------------- LLM CALL ----------------
-def call_ollama(prompt):
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": "llama3",
-            "prompt": prompt,
-            "stream": False
-        }
+    return OpenAI(
+        api_key=api_key,
+        base_url="https://api.groq.com/openai/v1"
     )
-    return response.json()["response"]
-
 
 # ---------------- BASIC ROUTES ----------------
 @app.get("/")
