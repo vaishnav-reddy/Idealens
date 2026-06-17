@@ -1,0 +1,15 @@
+.env
+node_modules/
+dist/  
+coverage/
+logs/   
+*.log
+.DS_Store   
+.vscode/
+.idea/
+*.iml
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+ 
