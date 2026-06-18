@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import Head from 'next/head';
 import dynamic from 'next/dynamic';
 import {
@@ -19,7 +19,12 @@ import {
   TrendingUp,
   UserCheck,
   TrendingDown,
-  Layers
+  Layers,
+  ChevronLeft,
+  ChevronRight,
+  Shield,
+  Eye,
+  EyeOff
 } from 'lucide-react';
 
 // Dynamically import Recharts to prevent SSR (Server-Side Rendering) issues
@@ -108,6 +113,17 @@ const CircularProgressRing = ({ score, size = 80, strokeWidth = 8 }) => {
   );
 };
 
+// Evidence field label mapping
+const EVIDENCE_LABELS = {
+  name: 'Name',
+  tagline: 'Tagline',
+  core_features: 'Core Features',
+  target_market: 'Target Market',
+  pricing_model: 'Pricing Model',
+  strengths: 'Strengths',
+  weaknesses: 'Weaknesses',
+};
+
 export default function Home() {
   const [idea, setIdea] = useState('');
   const [loading, setLoading] = useState(false);
@@ -115,28 +131,30 @@ export default function Home() {
   const [error, setError] = useState(null);
   const [data, setData] = useState(null);
   const [copied, setCopied] = useState(false);
+  const [expandedEvidence, setExpandedEvidence] = useState(new Set());
+
+  // Ref for competitor scroll container
+  const scrollRef = useRef(null);
 
   const steps = [
     "Parsing your idea...",
     "Searching for competitors...",
+    "Classifying sources...",
     "Analyzing competitor products...",
     "Generating strategy..."
   ];
 
   // Set up loading animations steps
   useEffect(() => {
-    let t1, t2, t3;
+    let timers = [];
     if (loading) {
       setLoadingStep(0);
-      t1 = setTimeout(() => setLoadingStep(1), 3000);
-      t2 = setTimeout(() => setLoadingStep(2), 6000);
-      t3 = setTimeout(() => setLoadingStep(3), 10000);
+      timers.push(setTimeout(() => setLoadingStep(1), 3000));
+      timers.push(setTimeout(() => setLoadingStep(2), 6000));
+      timers.push(setTimeout(() => setLoadingStep(3), 12000));
+      timers.push(setTimeout(() => setLoadingStep(4), 18000));
     }
-    return () => {
-      clearTimeout(t1);
-      clearTimeout(t2);
-      clearTimeout(t3);
-    };
+    return () => timers.forEach(clearTimeout);
   }, [loading]);
 
   const handleAnalyze = async (e) => {
@@ -146,6 +164,7 @@ export default function Home() {
     setLoading(true);
     setError(null);
     setData(null);
+    setExpandedEvidence(new Set());
 
     try {
       const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
@@ -170,6 +189,27 @@ export default function Home() {
     } finally {
       setLoading(false);
     }
+  };
+
+  const toggleEvidence = (idx) => {
+    setExpandedEvidence((prev) => {
+      const next = new Set(prev);
+      if (next.has(idx)) {
+        next.delete(idx);
+      } else {
+        next.add(idx);
+      }
+      return next;
+    });
+  };
+
+  const scrollCompetitors = (direction) => {
+    if (!scrollRef.current) return;
+    const cardWidth = 340 + 24; // card width + gap
+    scrollRef.current.scrollBy({
+      left: direction === 'right' ? cardWidth : -cardWidth,
+      behavior: 'smooth',
+    });
   };
 
   const handleCopyReport = () => {
@@ -274,13 +314,13 @@ ${data.strategy.suggestions
   };
 
   const chartData = getChartData();
-  const competitorColors = ['#10b981', '#f59e0b', '#ec4899'];
+  const competitorColors = ['#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#06b6d4', '#f97316', '#84cc16', '#e11d48'];
 
   return (
     <div className="min-h-screen bg-[#0a0a0a] text-neutral-200 antialiased selection:bg-blue-500 selection:text-white">
       <Head>
         <title>IdeaLens — AI Startup Validation & Competitive Intelligence</title>
-        <meta name="description" content="Validate your startup idea using an autonomous 4-agent AI pipeline and view a rich competitive intelligence dashboard." />
+        <meta name="description" content="Validate your startup idea using an autonomous multi-agent AI pipeline and view a rich competitive intelligence dashboard." />
         <link rel="icon" href="/favicon.ico" />
       </Head>
 
@@ -307,7 +347,7 @@ ${data.strategy.suggestions
             <span className="text-transparent bg-clip-text bg-gradient-to-r from-blue-400 to-indigo-500">You Build a Single Line</span>
           </h1>
           <p className="max-w-2xl mx-auto text-lg text-neutral-400 mb-8">
-            Enter your startup idea. Our 4-agent competitive pipeline parses details, searches active web listings, inspects product copy, and builds your interactive strategy dashboard instantly.
+            Enter your startup idea. Our multi-agent competitive pipeline parses details, searches active web listings, classifies and verifies sources, inspects product copy, and builds your interactive strategy dashboard instantly.
           </p>
 
           <form onSubmit={handleAnalyze} className="max-w-3xl mx-auto bg-[#111111] p-2 rounded-2xl border border-[#222222] shadow-xl shadow-black/50">
@@ -446,73 +486,150 @@ ${data.strategy.suggestions
               </div>
             </section>
 
-            {/* SECTION 3: COMPETITOR CARDS */}
+            {/* SECTION 3: COMPETITOR CARDS — HORIZONTALLY SCROLLABLE (CHANGE 6) */}
             <section className="fade-in delay-200">
-              <div className="mb-6">
-                <h3 className="text-lg font-semibold uppercase tracking-wider text-neutral-400">Identified Competitors</h3>
-                <p className="text-sm text-neutral-500">Live competitor products discovered and parsed on the web.</p>
+              <div className="mb-6 flex items-center justify-between">
+                <div>
+                  <h3 className="text-lg font-semibold uppercase tracking-wider text-neutral-400">Identified Competitors</h3>
+                  <p className="text-sm text-neutral-500">
+                    {data.competitors.length > 0
+                      ? `Showing ${data.competitors.length} real competitor${data.competitors.length === 1 ? '' : 's'}`
+                      : 'Live competitor products discovered and parsed on the web.'}
+                  </p>
+                </div>
+                {data.competitors.length > 1 && (
+                  <div className="flex items-center space-x-2">
+                    <button
+                      onClick={() => scrollCompetitors('left')}
+                      className="scroll-chevron"
+                      aria-label="Scroll left"
+                    >
+                      <ChevronLeft className="h-4 w-4" />
+                    </button>
+                    <button
+                      onClick={() => scrollCompetitors('right')}
+                      className="scroll-chevron"
+                      aria-label="Scroll right"
+                    >
+                      <ChevronRight className="h-4 w-4" />
+                    </button>
+                  </div>
+                )}
               </div>
 
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                {data.competitors.map((competitor, idx) => (
-                  <div key={idx} className="bg-[#111111] border border-[#222222] rounded-xl p-6 transition-card flex flex-col justify-between">
-                    <div>
-                      <div className="flex items-start justify-between gap-3 mb-2">
-                        <h4 className="text-lg font-bold text-white tracking-tight">{competitor.name}</h4>
-                        <a
-                          href={competitor.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="flex items-center text-xs text-blue-400 hover:text-blue-300 transition-colors shrink-0 bg-blue-950/40 border border-blue-900/40 px-2.5 py-1 rounded-lg"
-                        >
-                          <span className="mr-1.5">{getCleanDomain(competitor.url)}</span>
-                          <ExternalLink className="h-3.5 w-3.5" />
-                        </a>
-                      </div>
-                      <p className="text-xs text-neutral-400 italic mb-4">"{competitor.tagline}"</p>
-
-                      <div className="mb-6">
-                        <span className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500 block mb-2">Core Features</span>
-                        <ul className="space-y-2">
-                          {competitor.core_features.map((feature, fIdx) => (
-                            <li key={fIdx} className="flex items-start space-x-2 text-xs text-neutral-300">
-                              <Check className="h-3.5 w-3.5 text-blue-500 shrink-0 mt-0.5" />
-                              <span>{feature}</span>
-                            </li>
-                          ))}
-                        </ul>
-                      </div>
-                    </div>
-
-                    <div className="border-t border-neutral-900 pt-4 mt-6">
-                      <div className="flex items-center justify-between mb-4">
-                        <span className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500">Pricing Model</span>
-                        <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-neutral-800 text-neutral-300 border border-neutral-700">
-                          {competitor.pricing_model}
-                        </span>
-                      </div>
-                      <div className="grid grid-cols-2 gap-2 text-[11px]">
-                        <div>
-                          <span className="text-emerald-500 font-semibold block mb-1">Strengths</span>
-                          <ul className="space-y-1">
-                            {competitor.strengths.map((s, sIdx) => (
-                              <li key={sIdx} className="text-neutral-400 truncate">• {s}</li>
-                            ))}
-                          </ul>
-                        </div>
-                        <div>
-                          <span className="text-red-500 font-semibold block mb-1">Weaknesses</span>
-                          <ul className="space-y-1">
-                            {competitor.weaknesses.map((w, wIdx) => (
-                              <li key={wIdx} className="text-neutral-400 truncate">• {w}</li>
-                            ))}
-                          </ul>
-                        </div>
-                      </div>
+              {data.competitors.length === 0 ? (
+                /* Empty state */
+                <div className="bg-[#111111] border border-[#222222] rounded-xl p-8 text-center">
+                  <div className="flex justify-center mb-4">
+                    <div className="p-3 rounded-full bg-amber-950/30 border border-amber-900/40">
+                      <AlertCircle className="h-6 w-6 text-amber-400" />
                     </div>
                   </div>
-                ))}
-              </div>
+                  <h4 className="text-base font-semibold text-white mb-2">No live competitor products found</h4>
+                  <p className="text-sm text-neutral-400 max-w-md mx-auto">
+                    No live competitor products found for this idea — try rephrasing with a more specific feature or comparing to a known tool you're aware of.
+                  </p>
+                </div>
+              ) : (
+                <div ref={scrollRef} className="competitor-scroll-row">
+                  {data.competitors.map((competitor, idx) => (
+                    <div key={idx} className="bg-[#111111] border border-[#222222] rounded-xl p-6 transition-card flex flex-col justify-between">
+                      <div>
+                        <div className="flex items-start justify-between gap-3 mb-2">
+                          <h4 className="text-lg font-bold text-white tracking-tight">{competitor.name}</h4>
+                          <a
+                            href={competitor.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="flex items-center text-xs text-blue-400 hover:text-blue-300 transition-colors shrink-0 bg-blue-950/40 border border-blue-900/40 px-2.5 py-1 rounded-lg"
+                          >
+                            <span className="mr-1.5">{getCleanDomain(competitor.url)}</span>
+                            <ExternalLink className="h-3.5 w-3.5" />
+                          </a>
+                        </div>
+                        <p className="text-xs text-neutral-400 italic mb-4">"{competitor.tagline}"</p>
+
+                        <div className="mb-6">
+                          <span className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500 block mb-2">Core Features</span>
+                          <ul className="space-y-2">
+                            {(competitor.core_features || []).map((feature, fIdx) => (
+                              <li key={fIdx} className="flex items-start space-x-2 text-xs text-neutral-300">
+                                <Check className="h-3.5 w-3.5 text-blue-500 shrink-0 mt-0.5" />
+                                <span>{feature}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      </div>
+
+                      <div className="border-t border-neutral-900 pt-4 mt-6">
+                        <div className="flex items-center justify-between mb-4">
+                          <span className="text-[10px] font-semibold uppercase tracking-wider text-neutral-500">Pricing Model</span>
+                          <span className="text-xs font-semibold px-2.5 py-0.5 rounded-full bg-neutral-800 text-neutral-300 border border-neutral-700">
+                            {competitor.pricing_model}
+                          </span>
+                        </div>
+                        <div className="grid grid-cols-2 gap-2 text-[11px]">
+                          <div>
+                            <span className="text-emerald-500 font-semibold block mb-1">Strengths</span>
+                            <ul className="space-y-1">
+                              {(competitor.strengths || []).map((s, sIdx) => (
+                                <li key={sIdx} className="text-neutral-400 truncate">• {s}</li>
+                              ))}
+                              {(!competitor.strengths || competitor.strengths.length === 0) && (
+                                <li className="text-neutral-600 italic">Not stated on website</li>
+                              )}
+                            </ul>
+                          </div>
+                          <div>
+                            <span className="text-red-500 font-semibold block mb-1">Weaknesses</span>
+                            <ul className="space-y-1">
+                              {(competitor.weaknesses || []).map((w, wIdx) => (
+                                <li key={wIdx} className="text-neutral-400 truncate">• {w}</li>
+                              ))}
+                              {(!competitor.weaknesses || competitor.weaknesses.length === 0) && (
+                                <li className="text-neutral-600 italic">None inferred from text</li>
+                              )}
+                            </ul>
+                          </div>
+                        </div>
+
+                        {/* Verify sources toggle (CHANGE 4/6 evidence) */}
+                        {competitor.evidence && (
+                          <div className="mt-4 border-t border-neutral-900 pt-3">
+                            <button
+                              onClick={() => toggleEvidence(idx)}
+                              className="flex items-center space-x-2 text-[10px] font-semibold uppercase tracking-wider text-neutral-500 hover:text-blue-400 transition-colors w-full cursor-pointer"
+                            >
+                              {expandedEvidence.has(idx) ? (
+                                <EyeOff className="h-3 w-3" />
+                              ) : (
+                                <Eye className="h-3 w-3" />
+                              )}
+                              <span>{expandedEvidence.has(idx) ? 'Hide sources' : 'Verify sources'}</span>
+                              <Shield className="h-3 w-3 ml-auto text-blue-500/50" />
+                            </button>
+                            <div className={`verify-section ${expandedEvidence.has(idx) ? 'expanded' : ''}`}>
+                              <div className="mt-3 space-y-2">
+                                {Object.entries(EVIDENCE_LABELS).map(([key, label]) => {
+                                  const snippet = competitor.evidence[key];
+                                  if (!snippet) return null;
+                                  return (
+                                    <div key={key} className="flex items-start gap-2 text-[10px]">
+                                      <span className="text-neutral-500 font-semibold shrink-0 w-20 text-right">{label}:</span>
+                                      <span className="text-neutral-400 italic">"{snippet}"</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </section>
 
             {/* SECTIONS 4 & 5: POSITIONING CHART & FEATURE MATRIX */}

@@ -67,3 +67,70 @@ body {
 .delay-300 { animation-delay: 300ms; }
 .delay-400 { animation-delay: 400ms; }
 .delay-500 { animation-delay: 500ms; }
+
+/* ===== Horizontally scrollable competitor row (CHANGE 6) ===== */
+.competitor-scroll-row {
+  display: flex;
+  gap: 1.5rem;
+  overflow-x: auto;
+  scroll-snap-type: x mandatory;
+  scroll-behavior: smooth;
+  padding-bottom: 0.75rem;
+  -webkit-overflow-scrolling: touch;
+}
+
+.competitor-scroll-row > * {
+  scroll-snap-align: start;
+  flex-shrink: 0;
+  width: 340px;
+  min-width: 340px;
+}
+
+/* Horizontal scrollbar styling */
+.competitor-scroll-row::-webkit-scrollbar {
+  height: 6px;
+}
+.competitor-scroll-row::-webkit-scrollbar-track {
+  background: #111111;
+  border-radius: 3px;
+}
+.competitor-scroll-row::-webkit-scrollbar-thumb {
+  background: #333333;
+  border-radius: 3px;
+}
+.competitor-scroll-row::-webkit-scrollbar-thumb:hover {
+  background: #444444;
+}
+
+/* Chevron nav buttons */
+.scroll-chevron {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  background: #1a1a1a;
+  border: 1px solid #333333;
+  color: #999999;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  flex-shrink: 0;
+}
+
+.scroll-chevron:hover {
+  background: #222222;
+  border-color: #3b82f6;
+  color: #3b82f6;
+}
+
+/* Evidence/Verify toggle section */
+.verify-section {
+  max-height: 0;
+  overflow: hidden;
+  transition: max-height 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.verify-section.expanded {
+  max-height: 600px;
+}
