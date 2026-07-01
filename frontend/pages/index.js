@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import Head from 'next/head';
 import dynamic from 'next/dynamic';
 import {
@@ -128,13 +128,29 @@ export default function Home() {
   const [idea, setIdea] = useState('');
   const [loading, setLoading] = useState(false);
   const [loadingStep, setLoadingStep] = useState(0);
+  const [stepDetail, setStepDetail] = useState('');
   const [error, setError] = useState(null);
   const [data, setData] = useState(null);
   const [copied, setCopied] = useState(false);
   const [expandedEvidence, setExpandedEvidence] = useState(new Set());
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
 
   // Ref for competitor scroll container
   const scrollRef = useRef(null);
+
+  // FIX 6: Elapsed time counter during loading
+  useEffect(() => {
+    if (!loading) {
+      setElapsed(0);
+      return;
+    }
+    const start = Date.now();
+    const interval = setInterval(() => {
+      setElapsed(Math.floor((Date.now() - start) / 1000));
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [loading]);
 
   const steps = [
     "Parsing your idea...",
@@ -144,19 +160,6 @@ export default function Home() {
     "Generating strategy..."
   ];
 
-  // Set up loading animations steps
-  useEffect(() => {
-    let timers = [];
-    if (loading) {
-      setLoadingStep(0);
-      timers.push(setTimeout(() => setLoadingStep(1), 3000));
-      timers.push(setTimeout(() => setLoadingStep(2), 6000));
-      timers.push(setTimeout(() => setLoadingStep(3), 12000));
-      timers.push(setTimeout(() => setLoadingStep(4), 18000));
-    }
-    return () => timers.forEach(clearTimeout);
-  }, [loading]);
-
   const handleAnalyze = async (e) => {
     e.preventDefault();
     if (!idea.trim()) return;
@@ -164,11 +167,14 @@ export default function Home() {
     setLoading(true);
     setError(null);
     setData(null);
+    setLoadingStep(0);
+    setStepDetail('');
     setExpandedEvidence(new Set());
+    setDiagnosticsOpen(false);
 
     try {
       const backendUrl = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000';
-      const response = await fetch(`${backendUrl}/api/analyze`, {
+      const response = await fetch(`${backendUrl}/api/analyze-stream`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -181,13 +187,46 @@ export default function Home() {
         throw new Error(errorData.detail || 'An error occurred while analyzing your idea.');
       }
 
-      const result = await response.json();
-      setData(result);
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop();
+
+        for (const part of parts) {
+          const line = part.trim();
+          if (line.startsWith('data: ')) {
+            try {
+              const parsed = JSON.parse(line.slice(6));
+              if (parsed.type === 'step') {
+                setLoadingStep(parsed.step);
+                setStepDetail(parsed.detail || '');
+              } else if (parsed.type === 'result') {
+                setData(parsed.data);
+              } else if (parsed.type === 'error') {
+                throw new Error(parsed.message);
+              }
+            } catch (parseErr) {
+              if (parseErr.message && !parseErr.message.includes('Unexpected token') && !parseErr.message.includes('JSON')) {
+                throw parseErr;
+              }
+              console.warn('SSE parse warning:', parseErr);
+            }
+          }
+        }
+      }
     } catch (err) {
       console.error(err);
       setError(err.message || 'Failed to connect to the backend server. Make sure it is running.');
     } finally {
       setLoading(false);
+      setStepDetail('');
     }
   };
 
@@ -279,6 +318,14 @@ ${data.strategy.suggestions
     const ideaScores = data.strategy.idea_scores;
     const ideaOverall = calculateOverall(ideaScores);
 
+    // Fix A.4: Filter competitor scores to only include verified competitors
+    const verifiedNames = new Set(
+      (data.competitors || []).map(c => c.name.toLowerCase())
+    );
+    const filteredCompetitorScores = (data.strategy.competitor_scores || []).filter(
+      comp => verifiedNames.has(comp.name.toLowerCase())
+    );
+
     const metrics = [
       { subject: 'Innovation', label: 'Innovation' },
       { subject: 'Market Gap', label: 'Market Gap' },
@@ -298,7 +345,7 @@ ${data.strategy.suggestions
       else if (m.subject === 'Overall') item['Your Idea'] = ideaOverall;
 
       // Plot each competitor
-      data.strategy.competitor_scores.forEach(comp => {
+      filteredCompetitorScores.forEach(comp => {
         const compScores = comp.scores;
         const compOverall = calculateOverall(compScores);
 
@@ -314,6 +361,12 @@ ${data.strategy.suggestions
   };
 
   const chartData = getChartData();
+  // Fix A.4: Only render radar series for competitors that passed full verification
+  const verifiedCompetitorScores = data
+    ? (data.strategy?.competitor_scores || []).filter(
+        comp => (data.competitors || []).some(c => c.name.toLowerCase() === comp.name.toLowerCase())
+      )
+    : [];
   const competitorColors = ['#10b981', '#f59e0b', '#ec4899', '#8b5cf6', '#06b6d4', '#f97316', '#84cc16', '#e11d48'];
 
   return (
@@ -386,6 +439,9 @@ ${data.strategy.suggestions
                   <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500"></span>
                 </span>
                 <span>Active Agent Pipeline</span>
+                <span className="ml-auto text-xs text-neutral-500 font-mono tabular-nums">
+                  {elapsed >= 60 ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s` : `${elapsed}s`}
+                </span>
               </h3>
               <div className="space-y-4">
                 {steps.map((step, idx) => {
@@ -409,7 +465,9 @@ ${data.strategy.suggestions
                       </div>
                       <span className="text-sm">{step}</span>
                       {isActive && (
-                        <span className="text-xs text-blue-500 ml-auto animate-pulse">Running...</span>
+                        <span className="text-xs text-blue-500 ml-auto animate-pulse">
+                          {stepDetail || 'Running...'}
+                        </span>
                       )}
                     </div>
                   );
@@ -658,7 +716,7 @@ ${data.strategy.suggestions
                         fill="#3b82f6"
                         fillOpacity={0.25}
                       />
-                      {data.strategy.competitor_scores.map((comp, idx) => (
+                      {verifiedCompetitorScores.map((comp, idx) => (
                         <Radar
                           key={comp.name}
                           name={comp.name}
@@ -836,6 +894,58 @@ ${data.strategy.suggestions
                 </button>
               </div>
             </section>
+
+            {/* SECTION 9: PIPELINE DIAGNOSTICS */}
+            {data.verification_failures && data.verification_failures.length > 0 && (
+              <section className="fade-in delay-500 border border-[#222222] bg-[#111111]/30 rounded-xl overflow-hidden">
+                <button
+                  type="button"
+                  onClick={() => setDiagnosticsOpen(!diagnosticsOpen)}
+                  className="w-full flex items-center justify-between p-5 text-left font-semibold text-neutral-400 hover:text-white transition-colors cursor-pointer bg-[#111111]/10 border-0"
+                >
+                  <div className="flex items-center space-x-2.5">
+                    <Activity className="h-4 w-4 text-amber-500" />
+                    <span>Pipeline Diagnostics ({data.verification_failures.length} Verification Alert{data.verification_failures.length === 1 ? '' : 's'})</span>
+                  </div>
+                  <span className="text-xs text-neutral-500 font-normal">
+                    {diagnosticsOpen ? 'Collapse' : 'Expand'}
+                  </span>
+                </button>
+                {diagnosticsOpen && (
+                  <div className="border-t border-[#222222] p-5 bg-[#0b0b0b] space-y-4">
+                    <p className="text-xs text-neutral-400">
+                      The following named products from initial knowledge parsing could not be verified online. This is helpful to debug if searches are rate-limited, domains are blocked, or products have been rebranded/shut down.
+                    </p>
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead>
+                          <tr className="border-b border-[#222222] text-neutral-500">
+                            <th className="pb-2 font-semibold text-neutral-400">Competitor Name</th>
+                            <th className="pb-2 font-semibold text-neutral-400">Pipeline Stage</th>
+                            <th className="pb-2 font-semibold text-neutral-400">Failure Reason</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {data.verification_failures.map((fail, fIdx) => (
+                            <tr key={fIdx} className="border-b border-[#222222]/40 last:border-0 hover:bg-neutral-800/10">
+                              <td className="py-2.5 font-bold text-white pr-4">{fail.name}</td>
+                              <td className="py-2.5 pr-4">
+                                <span className="px-2 py-0.5 rounded text-[10px] uppercase font-bold tracking-wider bg-neutral-900 border border-neutral-800 text-neutral-400">
+                                  {fail.stage}
+                                </span>
+                              </td>
+                              <td className="py-2.5 text-neutral-400 leading-relaxed max-w-sm sm:max-w-none break-words">
+                                {fail.reason}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                )}
+              </section>
+            )}
 
           </div>
         )}

@@ -1,10 +1,15 @@
 import os
 import re
 import json
+import asyncio
+import time as _time_module
 import requests
+import httpx
+from collections import Counter
 from urllib.parse import urlparse
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
@@ -12,6 +17,16 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
+
+# =====================================================================
+# Jina API key support (FIX 1)
+# =====================================================================
+_JINA_API_KEY = os.getenv("JINA_API_KEY", "").strip()
+if not _JINA_API_KEY:
+    print(
+        "WARNING: JINA_API_KEY not set — Jina requests will share a strict "
+        "IP-wide rate limit. Add a free key from jina.ai for reliable operation."
+    )
 
 app = FastAPI(title="IdeaLens API", version="1.0.0")
 
@@ -25,9 +40,91 @@ app.add_middleware(
 )
 
 MODEL = "llama-3.3-70b-versatile"
+FALLBACK_MODEL = "llama-3.1-8b-instant"
+MAX_CANDIDATES = 10
+
+
+# =====================================================================
+# FIX 1: Concurrency / rate-limit throttle
+# =====================================================================
+class GroqThrottle:
+    """
+    Wraps asyncio.Semaphore(max_concurrent) + enforces a minimum stagger
+    between request starts, preventing TPM bursts.
+    """
+
+    def __init__(self, max_concurrent: int = 3, min_stagger_secs: float = 1.5):
+        self._sem = asyncio.Semaphore(max_concurrent)
+        self._lock = asyncio.Lock()
+        self._last_request_time: float = 0.0
+        self._min_stagger = min_stagger_secs
+
+    async def acquire(self):
+        await self._sem.acquire()
+        async with self._lock:
+            now = _time_module.monotonic()
+            elapsed = now - self._last_request_time
+            if elapsed < self._min_stagger:
+                await asyncio.sleep(self._min_stagger - elapsed)
+            self._last_request_time = _time_module.monotonic()
+
+    def release(self):
+        self._sem.release()
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *args):
+        self.release()
+
+
+_groq_throttle = GroqThrottle(max_concurrent=3, min_stagger_secs=1.5)
+
+
+# =====================================================================
+# FIX 2: Dedicated Jina concurrency limiter (separate from Groq)
+# =====================================================================
+class JinaThrottle:
+    """
+    Limits concurrent Jina Reader requests to 2 and staggers starts by
+    at least 500 ms to stay under the 100 RPM free-tier ceiling.
+    """
+
+    def __init__(self, max_concurrent: int = 2, min_stagger_secs: float = 0.5):
+        self._sem = asyncio.Semaphore(max_concurrent)
+        self._lock = asyncio.Lock()
+        self._last_request_time: float = 0.0
+        self._min_stagger = min_stagger_secs
+
+    async def acquire(self):
+        await self._sem.acquire()
+        async with self._lock:
+            now = _time_module.monotonic()
+            elapsed = now - self._last_request_time
+            if elapsed < self._min_stagger:
+                await asyncio.sleep(self._min_stagger - elapsed)
+            self._last_request_time = _time_module.monotonic()
+
+    def release(self):
+        self._sem.release()
+
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *args):
+        self.release()
+
+
+_jina_throttle = JinaThrottle(
+    max_concurrent=2 if _JINA_API_KEY else 1,
+    min_stagger_secs=0.5 if _JINA_API_KEY else 1.0,
+)
 
 
 def get_groq_client() -> Groq:
+    load_dotenv(override=True)
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         raise HTTPException(status_code=500, detail="GROQ_API_KEY environment variable is not set.")
@@ -60,43 +157,119 @@ def clean_and_parse_json(text: str) -> Dict[str, Any]:
         raise ValueError(f"Failed to parse JSON response: {text[:200]}...") from e
 
 
-def call_groq_json(system_prompt: str, user_content: str) -> Dict[str, Any]:
+# =====================================================================
+# FIX 4: Helpers for retry-after parsing and error classification
+# =====================================================================
+
+def _parse_retry_after(error_str: str) -> float:
+    """Parse the 'try again in Xs' or 'try again in XmYs' from a Groq error message."""
+    m = re.search(r"try again in (\d+(?:\.\d+)?)s", error_str, re.IGNORECASE)
+    if m:
+        return float(m.group(1)) + 1.0
+    m = re.search(r"try again in (\d+)m(\d+(?:\.\d+)?)s", error_str, re.IGNORECASE)
+    if m:
+        return int(m.group(1)) * 60 + float(m.group(2)) + 1.0
+    m = re.search(r"try again in (\d+)m", error_str, re.IGNORECASE)
+    if m:
+        return int(m.group(1)) * 60 + 2.0
+    return 10.0  # default fallback
+
+
+def _is_tpd_error(error_str: str) -> bool:
+    """Check if this is a daily (TPD) token limit error."""
+    low = error_str.lower()
+    return "tokens per day" in low or "tpd" in low or "daily" in low
+
+
+def _is_rate_limit_error(error_str: str) -> bool:
+    """Check if this is any kind of rate-limit error."""
+    return "429" in error_str or "rate_limit" in error_str.lower()
+
+
+# =====================================================================
+# FIX 4: Rewritten call_groq_json with proper fallback chain
+# =====================================================================
+
+def call_groq_json(system_prompt: str, user_content: str, _retries: int = 3) -> Dict[str, Any]:
     """
     Calls the Groq API and returns a parsed JSON response.
+    Fallback chain: llama-3.3-70b-versatile -> llama-3.1-8b-instant.
+    On TPD error: switches model immediately. On TPM error: parses the
+    server-provided retry-after delay and waits exactly that long + 1s buffer.
     """
     client = get_groq_client()
-    try:
-        response = client.chat.completions.create(
-            model=MODEL,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_content},
-            ],
-            temperature=0.2,
-            response_format={"type": "json_object"},
-        )
-        content = response.choices[0].message.content
-        return clean_and_parse_json(content)
-    except Exception as e:
-        # Retry without response_format, asking for JSON explicitly in the prompt
-        print(f"Groq API call with response_format=json failed: {e}. Retrying without response_format.")
+    current_model = MODEL
+
+    for attempt in range(1, _retries + 1):
         try:
             response = client.chat.completions.create(
-                model=MODEL,
+                model=current_model,
                 messages=[
-                    {
-                        "role": "system",
-                        "content": system_prompt
-                        + "\nIMPORTANT: Return ONLY raw JSON. Do not wrap in markdown or code blocks.",
-                    },
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": user_content},
                 ],
                 temperature=0.2,
+                response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content
             return clean_and_parse_json(content)
-        except Exception as retry_err:
-            raise HTTPException(status_code=500, detail=f"Groq API call failed: {str(retry_err)}")
+        except Exception as e:
+            error_str = str(e)
+
+            if _is_rate_limit_error(error_str):
+                # TPD on primary model -> switch to fallback for remaining retries
+                if current_model == MODEL and _is_tpd_error(error_str):
+                    print(f"  [RateLimit] TPD limit on {current_model}. Switching to {FALLBACK_MODEL}.")
+                    current_model = FALLBACK_MODEL
+                    continue  # retry immediately with the new model
+
+                # TPM or other rate limit -> parse wait time and sleep
+                wait_secs = min(_parse_retry_after(error_str), 60.0)
+
+                if attempt < _retries:
+                    print(f"  [RateLimit] {current_model} attempt {attempt}/{_retries}. Waiting {wait_secs:.1f}s...")
+                    _time_module.sleep(wait_secs)
+                    continue
+                else:
+                    raise HTTPException(
+                        status_code=429,
+                        detail=f"Groq rate limit exceeded after {_retries} retries on {current_model}. {error_str}"
+                    )
+
+            # Non-429 error: retry without response_format
+            print(f"Groq API call with response_format=json failed: {e}. Retrying without response_format.")
+            try:
+                response = client.chat.completions.create(
+                    model=current_model,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": system_prompt
+                            + "\nIMPORTANT: Return ONLY raw JSON. Do not wrap in markdown or code blocks.",
+                        },
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=0.2,
+                )
+                content = response.choices[0].message.content
+                return clean_and_parse_json(content)
+            except Exception as retry_err:
+                error_retry_str = str(retry_err)
+                if _is_rate_limit_error(error_retry_str) and attempt < _retries:
+                    wait_secs = min(_parse_retry_after(error_retry_str), 60.0)
+                    print(f"  [RateLimit] Retry fallback attempt {attempt}/{_retries}. Waiting {wait_secs:.1f}s...")
+                    _time_module.sleep(wait_secs)
+                    continue
+                raise HTTPException(status_code=500, detail=f"Groq API call failed: {str(retry_err)}")
+
+
+async def call_groq_json_async(system_prompt: str, user_content: str, _retries: int = 3) -> Dict[str, Any]:
+    """
+    Throttled async wrapper around call_groq_json.
+    Acquires the GroqThrottle (semaphore + stagger) before making the API call.
+    """
+    async with _groq_throttle:
+        return await asyncio.to_thread(call_groq_json, system_prompt, user_content, _retries)
 
 
 def extract_domain(url: str) -> str:
@@ -113,7 +286,7 @@ def extract_domain(url: str) -> str:
 
 def search_competitors(query: str) -> List[Dict[str, Any]]:
     """
-    Searches for competitors using the Tavily API.
+    Searches for competitors using the Tavily API (sync version).
     """
     api_key = os.getenv("TAVILY_API_KEY")
     if not api_key:
@@ -140,19 +313,48 @@ def search_competitors(query: str) -> List[Dict[str, Any]]:
             return []
 
 
-def fetch_jina_content(url: str, max_chars: int = 3000) -> Optional[str]:
+async def search_competitors_async(query: str) -> List[Dict[str, Any]]:
     """
-    Fetches page content via Jina Reader. Returns None on failure or if content is too short.
+    Async version of search_competitors. Tries httpx REST first, falls back to sync SDK via to_thread.
+    """
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        print("Warning: TAVILY_API_KEY is not set. Returning empty list.")
+        return []
+
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            res = await client.post(
+                "https://api.tavily.com/search",
+                json={"api_key": api_key, "query": query, "max_results": 5, "search_depth": "basic"},
+            )
+            res.raise_for_status()
+            return res.json().get("results", [])
+    except Exception as e:
+        print(f"Async Tavily REST failed for '{query[:50]}': {e}. Falling back to sync SDK.")
+        try:
+            return await asyncio.to_thread(search_competitors, query)
+        except Exception as fallback_err:
+            print(f"Sync fallback also failed: {fallback_err}")
+            return []
+
+
+def _jina_auth_headers() -> Dict[str, str]:
+    """Build Jina request headers, including Authorization if JINA_API_KEY is set."""
+    headers: Dict[str, str] = {}
+    if _JINA_API_KEY:
+        headers["Authorization"] = f"Bearer {_JINA_API_KEY}"
+    return headers
+
+
+def fetch_jina_content(url: str, max_chars: int = 6000) -> Optional[str]:
+    """
+    Fetches page content via Jina Reader (sync). Returns None on failure or if content is too short.
+    NOTE: The sync version has no concurrency control — use fetch_jina_content_async in the pipeline.
     """
     try:
         jina_url = f"https://r.jina.ai/{url}"
-        headers = {
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-        }
-        res = requests.get(jina_url, headers=headers, timeout=15)
+        res = requests.get(jina_url, headers=_jina_auth_headers(), timeout=15)
         res.raise_for_status()
         content = res.text
         if len(content) < 200:
@@ -164,10 +366,57 @@ def fetch_jina_content(url: str, max_chars: int = 3000) -> Optional[str]:
         return None
 
 
+async def fetch_jina_content_async(url: str, max_chars: int = 6000) -> Optional[str]:
+    """
+    Async Jina Reader fetch. Acquires the dedicated _jina_throttle
+    (Semaphore + stagger) before making the HTTP request.
+    Retries up to 3 times on 403 with exponential backoff, since 403
+    from Jina Reader typically means a transient IP-level rate limit.
+    """
+    max_retries = 3
+    backoff_secs = [5.0, 10.0, 20.0]
+
+    async with _jina_throttle:
+        for attempt in range(max_retries):
+            try:
+                jina_url = f"https://r.jina.ai/{url}"
+                async with httpx.AsyncClient(timeout=20.0) as client:
+                    res = await client.get(jina_url, headers=_jina_auth_headers())
+                    if res.status_code == 403 and attempt < max_retries - 1:
+                        wait = backoff_secs[attempt]
+                        print(f"Jina 403 for {url} (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                        await asyncio.sleep(wait)
+                        continue
+                    res.raise_for_status()
+                    content = res.text
+                    if len(content) < 200:
+                        print(f"Jina Reader returned < 200 chars for {url}, marking as dead.")
+                        return None
+                    return content[:max_chars]
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 403 and attempt < max_retries - 1:
+                    wait = backoff_secs[attempt]
+                    print(f"Jina 403 for {url} (attempt {attempt + 1}/{max_retries}), retrying in {wait}s...")
+                    await asyncio.sleep(wait)
+                    continue
+                print(f"Jina Reader async failed for {url}: {e}")
+                return None
+            except Exception as e:
+                print(f"Jina Reader async failed for {url}: {e}")
+                return None
+    return None
+
+
+# =====================================================================
+# Source Classifier (kept for standalone use; FIX 2: re-raise API errors)
+# =====================================================================
+
 def classify_page(content: str) -> Dict[str, Any]:
     """
-    CHANGE 3: Source Classifier — classifies a page as product_homepage,
+    Source Classifier -- classifies a page as product_homepage,
     listicle_or_review_site, or irrelevant.
+    FIX 2: Re-raises API errors (HTTPException, rate-limit) instead of
+    swallowing them as 'irrelevant'.
     """
     system_prompt = (
         "Classify this webpage content. Return ONLY valid JSON with keys:\n"
@@ -183,13 +432,134 @@ def classify_page(content: str) -> Dict[str, Any]:
         "pricing or feature tables. When in doubt between product_homepage and "
         "listicle_or_review_site, choose listicle_or_review_site."
     )
-    # Use first 2000 chars for classification (cheap and fast)
-    truncated = content[:2000]
+    # Use first 5000 chars for classification (cheap and fast)
+    truncated = content[:5000]
     try:
         return call_groq_json(system_prompt, truncated)
+    except HTTPException:
+        raise  # FIX 2: propagate API errors for retry queue
     except Exception as e:
+        if _is_rate_limit_error(str(e)):
+            raise  # FIX 2: propagate rate-limit errors
         print(f"Classification call failed: {e}")
         return {"page_type": "irrelevant", "product_name": None, "mentioned_products": []}
+
+
+# =====================================================================
+# FIX 3.2: Merged classify + relevance in ONE LLM call
+# =====================================================================
+
+def classify_and_check_relevance(idea_text: str, parsed_idea: Dict[str, Any], content: str) -> Dict[str, Any]:
+    """
+    Combined source classification + relevance check in a single LLM call.
+    Returns {page_type, product_name, mentioned_products, entity_type, is_relevant, relevance_reason}.
+    FIX 2: Re-raises API errors instead of swallowing them.
+    """
+    key_features = parsed_idea.get('key_features', [])
+
+    system_prompt = (
+        "You will classify a webpage AND evaluate its competitive relevance to a startup idea in one step.\n\n"
+        "Return ONLY valid JSON with ALL of these keys:\n"
+        "- page_type: one of 'product_homepage', 'listicle_or_review_site', 'irrelevant'\n"
+        "- product_name: if page_type is 'product_homepage', the actual product/company name "
+        "as it appears on the page. Otherwise null.\n"
+        "- mentioned_products: if page_type is 'listicle_or_review_site', array of real product "
+        "names mentioned in the content (max 8). Otherwise empty array.\n"
+        "- entity_type: one of 'software_product', 'course_or_certification', "
+        "'consulting_or_agency', 'hardware_or_physical_good', 'media_or_entertainment', "
+        "'other_non_product'\n"
+        "- is_relevant: boolean\n"
+        "- relevance_reason: one sentence\n\n"
+
+        "=== PAGE CLASSIFICATION RULES ===\n"
+        "A page is 'product_homepage' ONLY if it is clearly the official site/landing "
+        "page of ONE specific product, written in first-person marketing voice about that product. "
+        "A page listing, comparing, or reviewing MULTIPLE products (review aggregators, 'top 10' "
+        "articles, G2/Capterra-style category pages) is 'listicle_or_review_site', even if it has "
+        "pricing or feature tables. When in doubt between product_homepage and "
+        "listicle_or_review_site, choose listicle_or_review_site.\n\n"
+
+        "If page_type is NOT 'product_homepage', set entity_type to 'other_non_product', "
+        "is_relevant to false, and relevance_reason to 'Not a product homepage'.\n\n"
+
+        "=== RELEVANCE RULES (apply ONLY when page_type is 'product_homepage') ===\n"
+        "Step 1 -- Determine entity_type from the actual page content. If "
+        "entity_type is anything other than 'software_product', set "
+        "is_relevant to false automatically, regardless of keyword overlap. "
+        "Training providers, courses, certifications, agencies, and "
+        "consultancies are NEVER relevant competitors to a software idea, "
+        "even if their marketing copy uses words like 'AI,' 'platform,' or "
+        "'revolutionize.'\n\n"
+        "Step 2 -- If entity_type is 'software_product', evaluate JOB-LEVEL "
+        "overlap, not category-level overlap. Ask: 'If a user adopted this "
+        "candidate product instead of the user's idea, would it actually "
+        "solve the same core job?'\n\n"
+        "Use this test: compare the candidate's core function against the "
+        "user's key_features list. is_relevant is true ONLY if the candidate "
+        "shares at least 2 of the user's specific key_features as a primary "
+        "function (not a minor/secondary feature buried in a larger suite).\n\n"
+        "Clarification for Large Broad Platforms:\n"
+        "If the candidate is a large, multi-feature platform (e.g. an all-in-one project management or productivity suite), "
+        "check whether the SPECIFIC feature matching the user's key_features is explicitly marketed as a current, named feature "
+        "on the page (not assumed) -- even if it is one of many features listed, not the platform's sole focus. "
+        "Do not penalize relevance for a tool that does many things, as long as at least one explicitly described feature "
+        "directly matches at least one of the user's key_features (lower the previous '2 features' threshold to '1 explicit, named feature' "
+        "when the candidate is a known broad-platform type, since broad platforms naturally dilute any single feature's "
+        "prominence in their own marketing copy).\n\n"
+        "Examples of what must be marked false even though they sound related:\n"
+        "- A general note-taking app, when the idea is specifically about "
+        "AI-driven task prioritization -- note-taking is not the same job.\n"
+        "- A time-tracking tool, when the idea is about task prioritization "
+        "and habit learning -- time tracking is a different job.\n"
+        "- A video conferencing/chat platform, when the idea is a task "
+        "management app -- communication is not task management, even if "
+        "the platform has a task list as a minor feature.\n"
+        "- A broad all-in-one workspace (notes + docs + wiki + tasks), unless "
+        "its task-management capability specifically matches the user's "
+        "key_features (applying the broad platform rules above).\n\n"
+        "Be strict. When uncertain, set is_relevant to false. It is better to "
+        "under-include than to show a borderline or wrong-job product as a "
+        "direct competitor."
+    )
+
+    idea_context = (
+        f"USER'S STARTUP IDEA:\n{idea_text}\n\n"
+        f"PARSED IDEA FIELDS:\n"
+        f"Problem: {parsed_idea.get('problem', '')}\n"
+        f"Solution: {parsed_idea.get('solution', '')}\n"
+        f"Domain: {parsed_idea.get('domain', '')}\n"
+        f"Target Users: {parsed_idea.get('target_users', '')}\n"
+        f"Key Features (candidate MUST match at least 2 as primary functions, or 1 explicit named feature if large platform):\n"
+        + "\n".join(f"  - {f}" for f in key_features)
+        + f"\n\nWEBPAGE CONTENT TO CLASSIFY AND EVALUATE (first 5000 chars):\n{content[:5000]}"
+    )
+
+    try:
+        result = call_groq_json(system_prompt, idea_context)
+        # Enforce: non-software entities are never relevant
+        page_type = result.get("page_type", "irrelevant")
+        if page_type == "product_homepage":
+            entity_type = result.get("entity_type", "other_non_product")
+            if entity_type != "software_product":
+                result["is_relevant"] = False
+        else:
+            result["is_relevant"] = False
+            result["entity_type"] = result.get("entity_type", "other_non_product")
+        return result
+    except HTTPException:
+        raise  # FIX 2: propagate API errors for retry queue
+    except Exception as e:
+        if _is_rate_limit_error(str(e)):
+            raise  # FIX 2: propagate rate-limit errors
+        print(f"Classify+relevance call failed: {e}")
+        return {
+            "page_type": "irrelevant",
+            "product_name": None,
+            "mentioned_products": [],
+            "entity_type": "other_non_product",
+            "is_relevant": False,
+            "relevance_reason": f"Classification failed: {e}",
+        }
 
 
 def extract_competitor_profile(url: str, content: str) -> Optional[Dict[str, Any]]:
@@ -204,10 +574,10 @@ def extract_competitor_profile(url: str, content: str) -> Optional[Dict[str, Any
         "weaknesses (array, max 3), evidence (object).\n\n"
         "CRITICAL RULES:\n"
         "- If pricing is not mentioned anywhere in the text, set pricing_model to "
-        "'Not stated on website' — do NOT guess or use generic phrases like 'subscription-based' "
+        "'Not stated on website' -- do NOT guess or use generic phrases like 'subscription-based' "
         "unless those exact words or clear pricing numbers appear in the text.\n"
         "- Weaknesses must be inferred ONLY from what's absent or limited based on the actual "
-        "feature list you extracted — not generic SaaS weaknesses. If you cannot reasonably infer "
+        "feature list you extracted -- not generic SaaS weaknesses. If you cannot reasonably infer "
         "a weakness from the text, return fewer than 3 items rather than inventing one.\n"
         "- core_features must be features explicitly described in the text. Do not add common "
         "features of 'similar tools in general.'\n"
@@ -234,6 +604,7 @@ def check_relevance(idea_text: str, parsed_idea: Dict[str, Any], content: str) -
     First classifies entity_type (software vs non-software), then checks whether
     the candidate shares >=2 of the user's key_features as primary functions.
     Returns {entity_type: str, is_relevant: bool, relevance_reason: str}.
+    FIX 2: Re-raises API errors instead of defaulting to 'not relevant'.
     """
     system_prompt = (
         "You are screening competitor candidates for relevance. You will be "
@@ -245,14 +616,14 @@ def check_relevance(idea_text: str, parsed_idea: Dict[str, Any], content: str) -
         "'other_non_product'\n"
         "- is_relevant: boolean\n"
         "- relevance_reason: one sentence\n\n"
-        "Step 1 — Determine entity_type from the actual page content. If "
+        "Step 1 -- Determine entity_type from the actual page content. If "
         "entity_type is anything other than 'software_product', set "
         "is_relevant to false automatically, regardless of keyword overlap. "
         "Training providers, courses, certifications, agencies, and "
         "consultancies are NEVER relevant competitors to a software idea, "
         "even if their marketing copy uses words like 'AI,' 'platform,' or "
         "'revolutionize.'\n\n"
-        "Step 2 — If entity_type is 'software_product', evaluate JOB-LEVEL "
+        "Step 2 -- If entity_type is 'software_product', evaluate JOB-LEVEL "
         "overlap, not category-level overlap. Ask: 'If a user adopted this "
         "candidate product instead of the user's idea, would it actually "
         "solve the same core job?'\n\n"
@@ -260,19 +631,25 @@ def check_relevance(idea_text: str, parsed_idea: Dict[str, Any], content: str) -
         "user's key_features list. is_relevant is true ONLY if the candidate "
         "shares at least 2 of the user's specific key_features as a primary "
         "function (not a minor/secondary feature buried in a larger suite).\n\n"
+        "Clarification for Large Broad Platforms:\n"
+        "If the candidate is a large, multi-feature platform (e.g. an all-in-one project management or productivity suite), "
+        "check whether the SPECIFIC feature matching the user's key_features is explicitly marketed as a current, named feature "
+        "on the page (not assumed) -- even if it is one of many features listed, not the platform's sole focus. "
+        "Do not penalize relevance for a tool that does many things, as long as at least one explicitly described feature "
+        "directly matches at least one of the user's key_features (lower the previous '2 features' threshold to '1 explicit, named feature' "
+        "when the candidate is a known broad-platform type, since broad platforms naturally dilute any single feature's "
+        "prominence in their own marketing copy).\n\n"
         "Examples of what must be marked false even though they sound related:\n"
         "- A general note-taking app, when the idea is specifically about "
-        "AI-driven task prioritization — note-taking is not the same job.\n"
+        "AI-driven task prioritization -- note-taking is not the same job.\n"
         "- A time-tracking tool, when the idea is about task prioritization "
-        "and habit learning — time tracking is a different job.\n"
+        "and habit learning -- time tracking is a different job.\n"
         "- A video conferencing/chat platform, when the idea is a task "
-        "management app — communication is not task management, even if "
+        "management app -- communication is not task management, even if "
         "the platform has a task list as a minor feature.\n"
         "- A broad all-in-one workspace (notes + docs + wiki + tasks), unless "
-        "its task-management capability specifically matches 2+ of the "
-        "user's key_features (e.g. AI prioritization, habit learning) — "
-        "having 'tasks' as one of ten features in a different-purpose tool "
-        "is not enough.\n\n"
+        "its task-management capability specifically matches the user's "
+        "key_features (applying the broad platform rules above).\n\n"
         "Be strict. When uncertain, set is_relevant to false. It is better to "
         "under-include than to show a borderline or wrong-job product as a "
         "direct competitor."
@@ -286,9 +663,9 @@ def check_relevance(idea_text: str, parsed_idea: Dict[str, Any], content: str) -
         f"Solution: {parsed_idea.get('solution', '')}\n"
         f"Domain: {parsed_idea.get('domain', '')}\n"
         f"Target Users: {parsed_idea.get('target_users', '')}\n"
-        f"Key Features (the candidate MUST match at least 2 of these as primary functions):\n"
+        f"Key Features (candidate MUST match at least 2 features as primary functions, or at least 1 explicit named feature if it is a large multi-feature platform):\n"
         + "\n".join(f"  - {f}" for f in key_features)
-        + f"\n\nCANDIDATE PRODUCT PAGE CONTENT (first 1500 chars):\n{content[:1500]}"
+        + f"\n\nCANDIDATE PRODUCT PAGE CONTENT (first 5000 chars):\n{content[:5000]}"
     )
 
     try:
@@ -303,28 +680,277 @@ def check_relevance(idea_text: str, parsed_idea: Dict[str, Any], content: str) -
             "is_relevant": is_relevant,
             "relevance_reason": result.get("relevance_reason", "")
         }
+    except HTTPException:
+        raise  # FIX 2: propagate API errors for retry queue
     except Exception as e:
+        if _is_rate_limit_error(str(e)):
+            raise  # FIX 2: propagate rate-limit errors
         print(f"Relevance check failed: {e}")
-        # Default to not relevant on failure (strict)
-        return {"entity_type": "other_non_product", "is_relevant": False, "relevance_reason": "Relevance check failed"}
+        return {"entity_type": "other_non_product", "is_relevant": False, "relevance_reason": f"Relevance check failed: {e}"}
 
 
+# =====================================================================
+# Async parallel-processing helpers (rewritten for FIX 1, 2, 3.2)
+# =====================================================================
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok"}
+async def classify_and_check_relevance_async(idea_text: str, parsed_idea: Dict[str, Any], content: str) -> Dict[str, Any]:
+    """Throttled async wrapper for the merged classify + relevance call."""
+    async with _groq_throttle:
+        return await asyncio.to_thread(classify_and_check_relevance, idea_text, parsed_idea, content)
 
 
-@app.post("/api/analyze")
-def analyze_idea(request: AnalyzeRequest):
-    if not request.idea.strip():
-        raise HTTPException(status_code=400, detail="Idea text cannot be empty.")
+async def check_relevance_async(idea_text: str, parsed_idea: Dict[str, Any], content: str) -> Dict[str, Any]:
+    """Throttled async wrapper for standalone relevance check."""
+    async with _groq_throttle:
+        return await asyncio.to_thread(check_relevance, idea_text, parsed_idea, content)
 
-    print(f"Starting analysis for idea: {request.idea[:60]}...")
+
+async def extract_competitor_profile_async(url: str, content: str) -> Optional[Dict[str, Any]]:
+    """Throttled async wrapper for competitor profile extraction."""
+    async with _groq_throttle:
+        return await asyncio.to_thread(extract_competitor_profile, url, content)
+
+
+async def process_candidate(url: str, idea_text: str, parsed_idea: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Process a single candidate URL: fetch -> classify+relevance (merged, single LLM call).
+    FIX 1: No outer semaphore -- throttling is centralized in GroqThrottle.
+    FIX 2: API errors return 'unverified_api_error' instead of dropping.
+    FIX 3.2: Uses merged classify_and_check_relevance (1 call instead of 2).
+    """
+    print(f"  Fetching & classifying: {url}")
+    content = await fetch_jina_content_async(url)
+    if content is None:
+        print(f"    -> dead (fetch failed or < 200 chars)")
+        return {"status": "dead", "url": url}
+
+    try:
+        result = await classify_and_check_relevance_async(idea_text, parsed_idea, content)
+    except Exception as e:
+        error_str = str(e)
+        if isinstance(e, HTTPException) or _is_rate_limit_error(error_str):
+            print(f"    -> API error, marking unverified: {error_str[:120]}")
+            return {"status": "unverified_api_error", "url": url, "content": content}
+        print(f"    -> classification error: {e}")
+        return {"status": "irrelevant", "url": url}
+
+    page_type = result.get("page_type", "irrelevant")
+
+    if page_type == "product_homepage":
+        pname = result.get("product_name") or "Unknown"
+        is_relevant = bool(result.get("is_relevant", False))
+        entity_type = result.get("entity_type", "other_non_product")
+        reason = result.get("relevance_reason", "")
+
+        if not is_relevant:
+            print(f"    -> DROPPED [{entity_type}]: {reason}")
+            return {"status": "dropped", "url": url, "product_name": pname}
+
+        print(f"    -> RELEVANT [{entity_type}]: {reason}")
+        return {
+            "status": "relevant",
+            "url": url,
+            "content": content,
+            "product_name": pname,
+        }
+    elif page_type == "listicle_or_review_site":
+        mentioned = result.get("mentioned_products", [])
+        print(f"    -> listicle, mentioned products: {mentioned}")
+        return {"status": "listicle", "url": url, "mentioned_products": mentioned}
+    else:
+        print(f"    -> irrelevant, dropping")
+        return {"status": "irrelevant", "url": url}
+
+
+async def process_listicle_followup(
+    product_name: str, idea_text: str, parsed_idea: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """
+    Process a single listicle-mentioned product: search -> fetch -> classify+relevance (merged).
+    FIX 1: No outer semaphore. FIX 2: Returns unverified dict on API error. FIX 3.2: Merged call.
+    """
+    print(f"  Searching for official site: {product_name}")
+    followup_results = await search_competitors_async(f"{product_name} official website")
+    if not followup_results:
+        return None
+
+    top_result = followup_results[0]
+    fu_url = top_result.get("url", "")
+    fu_domain = extract_domain(fu_url)
+
+    fu_content = await fetch_jina_content_async(fu_url)
+    if fu_content is None:
+        print(f"    -> dead")
+        return None
+
+    try:
+        result = await classify_and_check_relevance_async(idea_text, parsed_idea, fu_content)
+    except Exception as e:
+        error_str = str(e)
+        if isinstance(e, HTTPException) or _is_rate_limit_error(error_str):
+            print(f"    -> API error, marking unverified: {error_str[:120]}")
+            return {
+                "status": "unverified_api_error",
+                "url": fu_url,
+                "domain": fu_domain,
+                "content": fu_content,
+                "product_name": product_name,
+            }
+        print(f"    -> classification error: {e}")
+        return None
+
+    page_type = result.get("page_type", "irrelevant")
+
+    if page_type != "product_homepage":
+        print(f"    -> not a product homepage ({page_type}), dropping")
+        return None
+
+    pname = result.get("product_name") or product_name
+    is_relevant = bool(result.get("is_relevant", False))
+    entity_type = result.get("entity_type", "other_non_product")
+    reason = result.get("relevance_reason", "")
+
+    if not is_relevant:
+        print(f"    -> DROPPED [{entity_type}]: {reason}")
+        return None
+
+    print(f"    -> RELEVANT [{entity_type}]: {reason}")
+    return {
+        "url": fu_url,
+        "domain": fu_domain,
+        "content": fu_content,
+        "product_name": pname,
+    }
+
+
+async def verify_named_competitor(name: str, idea_text: str, parsed_idea: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Verifies a specific named competitor from the likely_known_competitors list.
+    Steps: Search -> Fetch -> Relevance. Bypasses classification for named competitors.
+    FIX 1: Uses throttled check_relevance_async instead of outer semaphore.
+    """
+    print(f"  [Verification] Starting verification for '{name}'")
+    # 1. Search (using name + 'software' for official website relevance)
+    try:
+        query = f"{name} software"
+        results = await search_competitors_async(query)
+        if not results:
+            reason = f"No search results returned for query '{query}'"
+            print(f"  [Verification] FAILED: '{name}' at search. Reason: {reason}")
+            return {"status": "failed", "name": name, "stage": "search", "reason": reason}
+    except Exception as e:
+        reason = f"Search failed with exception: {str(e)}"
+        print(f"  [Verification] FAILED: '{name}' at search. Reason: {reason}")
+        return {"status": "failed", "name": name, "stage": "search", "reason": reason}
+
+    blacklist_domains = [
+        "wikipedia.org", "youtube.com", "g2.com", "capterra.com", "play.google.com",
+        "apps.apple.com", "twitter.com", "facebook.com", "linkedin.com", "quora.com",
+        "reddit.com", "medium.com", "github.com", "crunchbase.com", "glassdoor.com",
+        "softonic.com", "uptodown.com"
+    ]
+
+    # Iterate through all search results to bypass common Wikipedia/Review sites
+    last_failure = None
+    for idx, r in enumerate(results):
+        url = r.get("url", "")
+        print(f"  [Verification] Trying result {idx + 1} for '{name}': {url}")
+
+        url_lower = url.lower()
+        if any(dom in url_lower for dom in blacklist_domains):
+            last_failure = {
+                "status": "failed",
+                "name": name,
+                "stage": "classify",
+                "reason": f"Skipped non-homepage URL: {url}",
+                "url": url
+            }
+            continue
+
+        # 2. Fetch (throttled via _jina_throttle inside fetch_jina_content_async)
+        try:
+            content = await fetch_jina_content_async(url)
+            if not content:
+                last_failure = {
+                    "status": "failed",
+                    "name": name,
+                    "stage": "fetch",
+                    "reason": f"Failed to fetch page content via Jina from URL: {url}",
+                    "url": url
+                }
+                continue
+        except Exception as e:
+            last_failure = {
+                "status": "failed",
+                "name": name,
+                "stage": "fetch",
+                "reason": f"Fetch failed with exception: {str(e)} from URL: {url}",
+                "url": url
+            }
+            continue
+
+        # 3. Relevance (throttled via check_relevance_async)
+        try:
+            rel = await check_relevance_async(idea_text, parsed_idea, content)
+            if not rel["is_relevant"]:
+                last_failure = {
+                    "status": "failed",
+                    "name": name,
+                    "stage": "relevance",
+                    "reason": f"Relevance check failed: {rel.get('relevance_reason', 'No reason given')}",
+                    "url": url
+                }
+                continue
+        except Exception as e:
+            last_failure = {
+                "status": "failed",
+                "name": name,
+                "stage": "relevance",
+                "reason": f"Relevance check failed with exception: {str(e)}",
+                "url": url
+            }
+            continue
+
+        # If it reached here, it succeeded!
+        print(f"  [Verification] SUCCESS: '{name}' verified successfully at {url}")
+        return {
+            "status": "success",
+            "name": name,
+            "product_name": name,
+            "url": url,
+            "content": content
+        }
+
+    # If all results in loop failed
+    if last_failure:
+        print(f"  [Verification] FAILED: All candidate URLs failed verification for '{name}'. Last failure: {last_failure['reason']}")
+        return last_failure
+    else:
+        reason = f"No suitable homepage URL found in search results for '{name}'"
+        print(f"  [Verification] FAILED: '{name}'. Reason: {reason}")
+        return {"status": "failed", "name": name, "stage": "classify", "reason": reason}
+
+
+# =====================================================================
+# Core analysis pipeline
+# =====================================================================
+
+async def run_analysis(idea_text: str, progress_callback=None) -> Dict[str, Any]:
+    """
+    Core analysis pipeline. Runs Agents 1-4 with parallel candidate processing.
+    progress_callback(step, label, detail) is awaited at each major stage for SSE streaming.
+    """
+
+    async def emit(step: int, label: str, detail: str = ""):
+        if progress_callback:
+            await progress_callback(step, label, detail)
+
+    print(f"Starting analysis for idea: {idea_text[:60]}...")
 
     # =========================================================================
-    # AGENT 1: Idea Parser (CHANGE 1 — upgraded prompt)
+    # AGENT 1: Idea Parser (Fix A -- added industry_terms + strengthened likely_known_competitors)
     # =========================================================================
+    await emit(0, "Parsing your idea...")
     print("Running Agent 1: Idea Parser...")
     agent1_prompt = (
         "You are a startup analyst with broad knowledge of existing software products. "
@@ -336,35 +962,116 @@ def analyze_idea(request: AnalyzeRequest):
         "- key_features (array of 5 strings)\n"
         "- unique_angle (string)\n"
         "- likely_known_competitors: array of up to 5 REAL product names you already know of "
-        "that solve a similar problem (empty array if genuinely none come to mind — do not invent names)\n"
+        "that solve a similar problem (empty array if genuinely none come to mind -- do not invent names). "
+        "These will be directly verified via web search, so accuracy matters -- only include names "
+        "you are confident are real products.\n"
+        "- industry_terms: array of 3-5 alternate phrasings a professional in this exact industry "
+        "would use to describe the idea's core function, avoiding the user's literal wording where "
+        "the user may have used a layperson or non-standard term (e.g. if the user says 'CCTV cameras' "
+        "but the industry says 'proximal sensors' or 'machine vision cameras,' include the industry term)\n"
         "- search_queries: array of 4 distinct search query strings designed to find REAL competing "
         "products. Include at least one query using a known competitor name (e.g. 'alternatives to "
         "Grammarly for business email tone'), one category-based query, and one feature-specific query. "
         "Each search query must include at least one concrete term from the user's specific idea "
-        "(a feature, a target platform, or the exact problem) — not just generic category words like "
+        "(a feature, a target platform, or the exact problem) -- not just generic category words like "
         "'AI tool' or 'productivity app' alone. A query must be specific enough that an unrelated "
         "product in a different category would not plausibly rank for it.\n\n"
         "Return ONLY valid JSON, no markdown fences."
     )
-    parsed_idea = call_groq_json(agent1_prompt, request.idea)
+    parsed_idea = await call_groq_json_async(agent1_prompt, idea_text)
     print("Parsed Idea:", json.dumps(parsed_idea, indent=2)[:500])
 
+    # FIX 6: Granular progress after Agent 1
+    n_features = len(parsed_idea.get('key_features', []))
+    likely_known = parsed_idea.get("likely_known_competitors", [])
+    await emit(0, "Idea parsed", f"{n_features} features, {len(likely_known)} named competitors identified")
+
     # =========================================================================
-    # AGENT 2: Search & Discovery (CHANGE 2 — loop over all 4 search_queries)
+    # AGENT 2: Search & Discovery (Fix A -- direct verification + industry-term queries)
     # =========================================================================
     print("Running Agent 2: Search & Discovery...")
     search_queries = parsed_idea.get("search_queries", [])
+    industry_terms = parsed_idea.get("industry_terms", [])
+
     if not search_queries:
-        # Fallback: generate a basic query if Agent 1 didn't produce search_queries
-        fallback_query = f"{parsed_idea.get('solution', '')} {parsed_idea.get('domain', '')} competitors alternatives"
+        fallback_query = (
+            f"{parsed_idea.get('solution', '')} {parsed_idea.get('domain', '')} competitors alternatives"
+        )
         search_queries = [fallback_query]
 
-    all_results = []
-    seen_domains = set()
+    # Fix A.3: Generate industry-term alternate queries
+    if industry_terms:
+        domain = parsed_idea.get("domain", "")
+        for term in industry_terms[:2]:
+            alt_query = f"{term} software tools {domain} competitors"
+            search_queries.append(alt_query)
+            print(f"  Added industry-term query: {alt_query}")
 
-    for sq in search_queries:
-        print(f"  Tavily search: {sq}")
-        results = search_competitors(sq)
+    total_queries = len(search_queries)
+    print(f"  Running verification for {len(likely_known)} named competitors and {total_queries} general search queries.")
+    await emit(1, "Searching for competitors...", f"Verifying {len(likely_known)} named, running {total_queries} general queries")
+
+    # Run verification tasks and general searches in parallel
+    verification_tasks = [
+        verify_named_competitor(name, idea_text, parsed_idea)
+        for name in likely_known
+    ]
+    general_search_tasks = [
+        search_competitors_async(q)
+        for q in search_queries
+    ]
+
+    verification_results, general_search_results = await asyncio.gather(
+        asyncio.gather(*verification_tasks, return_exceptions=True),
+        asyncio.gather(*general_search_tasks, return_exceptions=True)
+    )
+
+    product_homepages = []          # list of {url, content, product_name}
+    covered_product_names = set()   # product names already covered by homepage results
+    seen_domains = set()
+    verification_failures = []
+
+    # Process verification results
+    for i, res in enumerate(verification_results):
+        name = likely_known[i]
+        if isinstance(res, Exception):
+            err_reason = f"Verification task crashed with exception: {str(res)}"
+            print(f"  [Verification Fail] Name: {name}, Reason: {err_reason}")
+            verification_failures.append({
+                "name": name,
+                "stage": "verify",
+                "reason": err_reason
+            })
+            continue
+
+        if res.get("status") == "success":
+            pname = res["product_name"]
+            url = res["url"]
+            domain = extract_domain(url)
+
+            product_homepages.append({
+                "url": url,
+                "content": res["content"],
+                "product_name": pname,
+            })
+            covered_product_names.add(pname.lower().strip())
+            if domain:
+                seen_domains.add(domain)
+        else:
+            verification_failures.append({
+                "name": res["name"],
+                "stage": res["stage"],
+                "reason": res["reason"]
+            })
+
+    # Process general search queries
+    all_results = []
+    for i, results in enumerate(general_search_results):
+        if isinstance(results, Exception):
+            print(f"  General search query {i} failed: {results}")
+            continue
+        query_label = search_queries[i] if i < len(search_queries) else "unknown"
+        print(f"  Tavily search: {query_label[:60]} -> {len(results)} results")
         for r in results:
             url = r.get("url", "")
             domain = extract_domain(url)
@@ -372,140 +1079,297 @@ def analyze_idea(request: AnalyzeRequest):
                 seen_domains.add(domain)
                 all_results.append(r)
 
-    print(f"Agent 2: {len(all_results)} unique candidate URLs after deduplication across {len(search_queries)} queries.")
+    # FIX 3.3: Hard cap at MAX_CANDIDATES (now 10)
+    if len(all_results) > MAX_CANDIDATES:
+        print(f"  Capping general candidates from {len(all_results)} to {MAX_CANDIDATES}")
+        all_results = all_results[:MAX_CANDIDATES]
+
+    print(
+        f"Agent 2: {len(all_results)} unique candidate URLs after deduplication "
+        f"across {total_queries} queries."
+    )
+
+    # FIX 6: Granular progress after search
+    await emit(1, "Search complete", f"{len(all_results)} candidate URLs found, {len(product_homepages)} named verified")
 
     # =========================================================================
-    # NEW AGENT: Source Classifier (CHANGE 3 — insert before old Agent 3)
+    # Source Classifier -- parallel processing (FIX 3.2: merged call)
     # =========================================================================
+    await emit(2, "Classifying sources...", f"Processing {len(all_results)} candidates")
     print("Running Source Classifier...")
 
-    # Phase 1: Fetch and classify all candidates
-    product_homepages = []        # list of {url, content, product_name}
-    listicle_mentioned = set()    # product names mentioned in listicles
-    covered_product_names = set() # product names already covered by homepage results
-
+    # Phase 1: Process all candidates in parallel (fetch -> merged classify+relevance)
+    candidate_tasks = []
     for result in all_results:
         url = result.get("url", "")
-        if not url:
+        if url:
+            candidate_tasks.append(process_candidate(url, idea_text, parsed_idea))
+
+    phase1_results = await asyncio.gather(*candidate_tasks, return_exceptions=True)
+
+    listicle_mention_counts = Counter()  # FIX 3.1: count frequency for capping
+    retry_queue = []                     # FIX 2: collect unverified candidates
+
+    for result in phase1_results:
+        if isinstance(result, Exception):
+            print(f"  Candidate processing error: {result}")
             continue
-
-        print(f"  Fetching & classifying: {url}")
-        content = fetch_jina_content(url)
-        if content is None:
-            print(f"    → dead (fetch failed or < 200 chars)")
-            continue
-
-        classification = classify_page(content)
-        page_type = classification.get("page_type", "irrelevant")
-
-        if page_type == "product_homepage":
-            pname = classification.get("product_name") or result.get("title", "Unknown")
-            print(f"    → product_homepage: {pname}")
-            # Relevance gate: check if this product actually competes with the idea
-            rel = check_relevance(request.idea, parsed_idea, content)
-            if not rel["is_relevant"]:
-                print(f"    → DROPPED [{rel.get('entity_type', 'unknown')}]: {rel['relevance_reason']}")
-                continue
-            print(f"    → RELEVANT [{rel.get('entity_type', 'software_product')}]: {rel['relevance_reason']}")
-            product_homepages.append({
-                "url": url,
-                "content": content,
-                "product_name": pname,
-            })
-            covered_product_names.add(pname.lower().strip())
-        elif page_type == "listicle_or_review_site":
-            mentioned = classification.get("mentioned_products", [])
-            print(f"    → listicle, mentioned products: {mentioned}")
-            for name in mentioned:
+        if result["status"] == "relevant":
+            pname = result["product_name"]
+            url = result["url"]
+            if pname.lower().strip() not in covered_product_names:
+                product_homepages.append({
+                    "url": url,
+                    "content": result["content"],
+                    "product_name": pname,
+                })
+                covered_product_names.add(pname.lower().strip())
+        elif result["status"] == "listicle":
+            for name in result.get("mentioned_products", []):
                 if name and name.lower().strip() not in covered_product_names:
-                    listicle_mentioned.add(name.strip())
-        else:
-            print(f"    → irrelevant, dropping")
+                    listicle_mention_counts[name.strip()] += 1
+        elif result["status"] == "unverified_api_error":
+            # FIX 2: save for retry
+            retry_queue.append(result)
 
-    # Phase 2: Follow up on listicle-mentioned products not already covered
-    if listicle_mentioned:
-        print(f"Source Classifier Phase 2: Following up on {len(listicle_mentioned)} listicle-mentioned products...")
-        for product_name in listicle_mentioned:
-            if product_name.lower().strip() in covered_product_names:
+    # FIX 6: Granular progress after Phase 1
+    n_relevant = sum(1 for r in phase1_results if not isinstance(r, Exception) and r.get("status") == "relevant")
+    n_unverified = len(retry_queue)
+    await emit(2, "Phase 1 classified", f"{n_relevant} relevant, {n_unverified} pending retry")
+
+    # Phase 2: Follow up on listicle-mentioned products not already covered (parallel)
+    # FIX 3.1: Sort by frequency descending, cap at 10
+    to_followup = sorted(
+        listicle_mention_counts.keys(),
+        key=lambda n: (-listicle_mention_counts[n], n.lower())
+    )
+    # Filter out products already covered
+    to_followup = [
+        name for name in to_followup
+        if name.lower().strip() not in covered_product_names
+    ][:10]  # FIX 3.1: cap at 10
+
+    if to_followup:
+        print(
+            f"Source Classifier Phase 2: Following up on "
+            f"{len(to_followup)} listicle-mentioned products (capped at 10)..."
+        )
+        await emit(2, "Following up listicle mentions...", f"{len(to_followup)} names to check")
+
+        followup_tasks = [
+            process_listicle_followup(name, idea_text, parsed_idea)
+            for name in to_followup
+        ]
+        followup_results = await asyncio.gather(*followup_tasks, return_exceptions=True)
+
+        for result in followup_results:
+            if isinstance(result, Exception):
+                print(f"  Followup error: {result}")
                 continue
-            print(f"  Searching for official site: {product_name}")
-            followup_results = search_competitors(f"{product_name} official website")
-            if followup_results:
-                top_result = followup_results[0]
-                fu_url = top_result.get("url", "")
-                fu_domain = extract_domain(fu_url)
-                # Skip if we already have this domain
-                if fu_domain in seen_domains:
-                    print(f"    → already have domain {fu_domain}, skipping")
-                    continue
-                seen_domains.add(fu_domain)
-
-                fu_content = fetch_jina_content(fu_url)
-                if fu_content is None:
-                    print(f"    → dead")
-                    continue
-                fu_class = classify_page(fu_content)
-                if fu_class.get("page_type") == "product_homepage":
-                    pname = fu_class.get("product_name") or product_name
-                    print(f"    → confirmed product_homepage: {pname}")
-                    # Relevance gate for listicle-mined candidates too
-                    rel = check_relevance(request.idea, parsed_idea, fu_content)
-                    if not rel["is_relevant"]:
-                        print(f"    → DROPPED [{rel.get('entity_type', 'unknown')}]: {rel['relevance_reason']}")
-                        continue
-                    print(f"    → RELEVANT [{rel.get('entity_type', 'software_product')}]: {rel['relevance_reason']}")
+            if result is None:
+                continue
+            # FIX 2: check for unverified_api_error from listicle followup
+            if isinstance(result, dict) and result.get("status") == "unverified_api_error":
+                retry_queue.append(result)
+                continue
+            # Deduplicate by domain after parallel gathering
+            if result.get("domain") and result["domain"] not in seen_domains:
+                seen_domains.add(result["domain"])
+                pname = result["product_name"]
+                if pname.lower().strip() not in covered_product_names:
                     product_homepages.append({
-                        "url": fu_url,
-                        "content": fu_content,
+                        "url": result["url"],
+                        "content": result["content"],
                         "product_name": pname,
                     })
                     covered_product_names.add(pname.lower().strip())
+
+    # =========================================================================
+    # FIX 2: Retry queue -- sequential retry after 20s cooldown
+    # =========================================================================
+    if retry_queue:
+        print(f"  Retry queue: {len(retry_queue)} candidates to retry after 20s cooldown...")
+        await emit(2, "Retrying unverified candidates...", f"{len(retry_queue)} to retry after cooldown")
+        await asyncio.sleep(20)
+
+        recovered = 0
+        for item in retry_queue:
+            url = item.get("url", "")
+            content = item.get("content", "")
+            if not content:
+                print(f"    [Retry] No content saved for {url}, skipping")
+                continue
+            try:
+                result = await classify_and_check_relevance_async(idea_text, parsed_idea, content)
+                page_type = result.get("page_type", "irrelevant")
+                if page_type == "product_homepage":
+                    pname = result.get("product_name") or "Unknown"
+                    is_relevant = bool(result.get("is_relevant", False))
+                    if is_relevant and pname.lower().strip() not in covered_product_names:
+                        product_homepages.append({
+                            "url": url,
+                            "content": content,
+                            "product_name": pname,
+                        })
+                        covered_product_names.add(pname.lower().strip())
+                        domain = extract_domain(url)
+                        if domain:
+                            seen_domains.add(domain)
+                        recovered += 1
+                        print(f"    [Retry] RECOVERED: {pname} at {url}")
+                    else:
+                        print(f"    [Retry] Still irrelevant: {pname} ({result.get('relevance_reason', '')})")
+                elif page_type == "listicle_or_review_site":
+                    print(f"    [Retry] Listicle, skipping: {url}")
                 else:
-                    print(f"    → not a product homepage ({fu_class.get('page_type')}), dropping")
+                    print(f"    [Retry] Irrelevant: {url}")
+            except Exception as e:
+                print(f"    [Retry] Failed again: {url} ({e})")
 
-    print(f"Source Classifier complete: {len(product_homepages)} relevant software competitors (after strict job-level filtering).")
+        print(f"  Retry complete: {recovered} candidates recovered out of {len(retry_queue)}")
+
+    # FIX 6: Final classification summary
+    await emit(2, "Classification complete", f"{len(product_homepages)} relevant competitors confirmed")
+
+    print(
+        f"Source Classifier complete: {len(product_homepages)} relevant software "
+        f"competitors (after strict job-level filtering)."
+    )
 
     # =========================================================================
-    # AGENT 3: Competitor Intelligence (CHANGE 4 + CHANGE 5 — grounded, all results)
+    # AGENT 3: Competitor Intelligence -- parallel extraction
     # =========================================================================
+    await emit(
+        3, "Analyzing competitor products...",
+        f"Extracting {len(product_homepages)} profiles"
+    )
     print("Running Agent 3: Competitor Intelligence (grounded extraction)...")
+
+    extraction_tasks = [
+        extract_competitor_profile_async(hp["url"], hp["content"])
+        for hp in product_homepages
+    ]
+    extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
+
     competitors = []
-    for homepage in product_homepages:  # CHANGE 5: no slice — process ALL
-        url = homepage["url"]
-        content = homepage["content"]
-        print(f"  Extracting profile: {url}")
-        profile = extract_competitor_profile(url, content)
-        if profile:
-            competitors.append(profile)
+    for i, result in enumerate(extraction_results):
+        if isinstance(result, Exception):
+            print(f"  Extraction error for {product_homepages[i]['url']}: {result}")
+            continue
+        if result is not None:
+            competitors.append(result)
+            print(f"  Extracted profile: {result.get('name', 'Unknown')}")
 
     print(f"Agent 3 complete: {len(competitors)} competitor profiles extracted.")
 
+    # FIX 6: Progress after extraction
+    await emit(3, "Profiles extracted", f"{len(competitors)} competitor profiles ready")
+
     # =========================================================================
-    # AGENT 4: Strategy Agent (CHANGE 7 — core_features grounding)
+    # AGENT 4: Strategy Agent (FIX 5: decoupled competitor references)
     # =========================================================================
+    await emit(4, "Generating strategy...")
     print("Running Agent 4: Strategy Agent...")
+
+    # FIX 5: Strip fields that could leak names into Agent 4
+    idea_for_strategy = {
+        k: v for k, v in parsed_idea.items()
+        if k not in ("likely_known_competitors", "industry_terms", "search_queries")
+    }
+
     agent4_prompt = (
-        "You are a startup strategist. Compare this idea against these competitors. "
+        "You are a startup strategist. Compare this idea against the verified competitor profiles provided. "
         "Return ONLY valid JSON with keys:\n"
         "- feature_matrix: object where each key is a feature name (8 features total), "
         "value is object with keys: user_idea (boolean), and one key per competitor name (boolean)\n"
-        "- idea_scores: object with keys innovation, market_gap, feasibility, competition_density — each a number 0-100\n"
+        "- idea_scores: object with keys innovation, market_gap, feasibility, competition_density -- each a number 0-100\n"
         "- competitor_scores: array of objects, each with name and scores object (same 4 keys, each 0-100)\n"
         "- suggestions: array of 5 objects each with keys: title (string), description (string), priority (High/Medium/Low)\n"
         "- summary: 2 sentence executive summary string\n\n"
         "Base feature_matrix and comparison entirely on the core_features arrays provided for each "
-        "competitor — do not assume a competitor has a feature unless it appears in their core_features list."
+        "competitor -- do not assume a competitor has a feature unless it appears in their core_features list.\n\n"
+        "You must reference competitors ONLY by the exact names present in the competitor_profiles list provided to you in this prompt. "
+        "Never reference likely_known_competitors, parsed_idea fields, or any name from earlier pipeline stages "
+        "that is not in the final competitor_profiles list. "
+        "Do not name, imply, or reference any product, company, or tool that is not in the competitor_profiles list, "
+        "even if you recognize it as a real and relevant competitor from general knowledge. "
+        "If the competitor_profiles list is empty, your summary and verdict must describe the result based solely "
+        "on the idea's characteristics and explicitly state that no verified competitors were found in this analysis -- "
+        "do not name any companies in that case."
     )
 
-    strategy_payload = {"parsed_idea": parsed_idea, "competitors": competitors}
-    strategy = call_groq_json(agent4_prompt, json.dumps(strategy_payload))
+    strategy_payload = {"idea": idea_for_strategy, "competitor_profiles": competitors}
+    strategy = await call_groq_json_async(agent4_prompt, json.dumps(strategy_payload))
     print("Strategy summary:", strategy.get("summary"))
 
     return {
         "parsed_idea": parsed_idea,
         "competitors": competitors,
         "strategy": strategy,
+        "verification_failures": verification_failures,
     }
+
+
+# =====================================================================
+# API Endpoints
+# =====================================================================
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
+
+@app.post("/api/analyze")
+async def analyze_idea(request: AnalyzeRequest):
+    """Standard JSON response endpoint (backward compatible)."""
+    if not request.idea.strip():
+        raise HTTPException(status_code=400, detail="Idea text cannot be empty.")
+    return await run_analysis(request.idea)
+
+
+@app.post("/api/analyze-stream")
+async def analyze_idea_stream(request: AnalyzeRequest):
+    """
+    SSE streaming endpoint. Emits real-time progress events as the pipeline runs,
+    followed by a final result event containing the full analysis.
+    """
+    if not request.idea.strip():
+        raise HTTPException(status_code=400, detail="Idea text cannot be empty.")
+
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def progress_callback(step: int, label: str, detail: str = ""):
+        await queue.put({"type": "step", "step": step, "label": label, "detail": detail})
+
+    async def run_in_background():
+        try:
+            result = await run_analysis(request.idea, progress_callback)
+            await queue.put({"type": "result", "data": result})
+        except HTTPException as e:
+            await queue.put({"type": "error", "message": e.detail})
+        except Exception as e:
+            await queue.put({"type": "error", "message": str(e)})
+        # Sentinel to signal end of stream
+        await queue.put(None)
+
+    async def event_generator():
+        task = asyncio.create_task(run_in_background())
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield f"data: {json.dumps(item)}\n\n"
+        await task
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 if __name__ == "__main__":
