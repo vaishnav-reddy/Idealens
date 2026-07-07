@@ -41,7 +41,35 @@ app.add_middleware(
 
 MODEL = "llama-3.3-70b-versatile"
 FALLBACK_MODEL = "llama-3.1-8b-instant"
-MAX_CANDIDATES = 10
+MAX_CANDIDATES = 5  # Tier 2 (general search URLs) cap — reduced from 7
+
+
+# =====================================================================
+# CHANGE 2: Domain blocklist — skip Jina fetch + Groq entirely
+# =====================================================================
+BLOCKED_DOMAINS: frozenset = frozenset([
+    "wikipedia.org", "youtube.com", "linkedin.com", "play.google.com",
+    "apps.apple.com", "reddit.com", "twitter.com", "x.com", "medium.com",
+    "quora.com", "trustpilot.com", "facebook.com", "instagram.com",
+    "glassdoor.com", "yelp.com", "g2.com", "capterra.com", "producthunt.com",
+])
+
+
+def is_blocked_domain(url: str) -> bool:
+    """
+    Returns True if the URL's root domain is in the BLOCKED_DOMAINS set.
+    Logs the skip for diagnostics.
+    """
+    try:
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower().removeprefix("www.")
+        # Check exact match and suffix match (e.g. sub.wikipedia.org)
+        for blocked in BLOCKED_DOMAINS:
+            if hostname == blocked or hostname.endswith("." + blocked):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 # =====================================================================
@@ -350,8 +378,12 @@ def _jina_auth_headers() -> Dict[str, str]:
 def fetch_jina_content(url: str, max_chars: int = 6000) -> Optional[str]:
     """
     Fetches page content via Jina Reader (sync). Returns None on failure or if content is too short.
+    CHANGE 2: Checks domain blocklist before making the HTTP request.
     NOTE: The sync version has no concurrency control — use fetch_jina_content_async in the pipeline.
     """
+    if is_blocked_domain(url):
+        print(f"  [Blocklist] Skipping blocked domain (sync): {url} — skipped_blocked_domain")
+        return None
     try:
         jina_url = f"https://r.jina.ai/{url}"
         res = requests.get(jina_url, headers=_jina_auth_headers(), timeout=15)
@@ -370,9 +402,15 @@ async def fetch_jina_content_async(url: str, max_chars: int = 6000) -> Optional[
     """
     Async Jina Reader fetch. Acquires the dedicated _jina_throttle
     (Semaphore + stagger) before making the HTTP request.
+    CHANGE 2: Checks domain blocklist before making the HTTP request — no Jina cost incurred.
     Retries up to 3 times on 403 with exponential backoff, since 403
     from Jina Reader typically means a transient IP-level rate limit.
     """
+    # CHANGE 2: Pre-flight blocklist check — free, no Jina fetch needed
+    if is_blocked_domain(url):
+        print(f"  [Blocklist] Skipping blocked domain: {url} — skipped_blocked_domain")
+        return None
+
     max_retries = 3
     backoff_secs = [5.0, 10.0, 20.0]
 
@@ -564,7 +602,8 @@ def classify_and_check_relevance(idea_text: str, parsed_idea: Dict[str, Any], co
 
 def extract_competitor_profile(url: str, content: str) -> Optional[Dict[str, Any]]:
     """
-    CHANGE 4: Grounded Competitor Intelligence extraction with evidence snippets.
+    Grounded Competitor Intelligence extraction with evidence snippets.
+    Used for Tier 2 (general search) candidates that have already passed the classify+relevance gate.
     """
     system_prompt = (
         "You are a competitive intelligence analyst. You will be given raw text scraped from "
@@ -595,6 +634,58 @@ def extract_competitor_profile(url: str, content: str) -> Optional[Dict[str, Any
         return profile
     except Exception as e:
         print(f"Groq analysis failed for competitor {url}: {e}")
+        return None
+
+
+def extract_competitor_profile_tier1(
+    url: str, content: str, idea_text: str, parsed_idea: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """
+    CHANGE 1: Tier 1 extraction for named/listicle candidates.
+    Skips the separate classify+relevance Groq call. Instead, embeds a lightweight
+    relevance check directly into the extraction prompt — costs the same tokens as
+    a plain extraction call but recovers the separate classify+relevance call.
+    Returns None if the model determines the product is clearly not relevant.
+    """
+    key_features = parsed_idea.get('key_features', [])
+    system_prompt = (
+        "You are a competitive intelligence analyst. You will be given raw text scraped from "
+        "a named product's website that we have reason to believe is a competitor.\n\n"
+        "First, quickly determine: does this page describe a real software product that serves "
+        "the same core job as the user's idea? If the page is clearly not a software product "
+        "homepage (e.g. it is a blog, news article, social profile, app-store listing, or "
+        "an entirely unrelated product), return ONLY: {\"is_relevant\": false}.\n\n"
+        "If it IS a plausible competitor (a software product with any overlap to the user's idea), "
+        "extract the full profile AND set is_relevant to true.\n\n"
+        "Return ONLY valid JSON with keys: is_relevant (boolean), name (string), tagline (string), "
+        "core_features (array, max 6), target_market (string), pricing_model (string), "
+        "strengths (array, max 3), weaknesses (array, max 3), evidence (object).\n\n"
+        "CRITICAL RULES:\n"
+        "- If pricing is not mentioned anywhere in the text, set pricing_model to "
+        "'Not stated on website'.\n"
+        "- Weaknesses must be inferred ONLY from what's absent or limited based on the actual "
+        "feature list you extracted — not generic SaaS weaknesses.\n"
+        "- core_features must be features explicitly described in the text.\n"
+        "- Every value must be traceable to a specific phrase in the provided text.\n"
+        "- The 'evidence' field maps each of the 7 profile keys to the exact short snippet "
+        "(max 15 words) from the source text that justifies that value."
+    )
+
+    idea_context = (
+        f"USER'S STARTUP IDEA:\n{idea_text}\n\n"
+        f"Key Features of the idea:\n"
+        + "\n".join(f"  - {f}" for f in key_features)
+        + f"\n\nProduct URL: {url}\n\nContent (first 6000 chars):\n{content[:6000]}"
+    )
+
+    try:
+        result = call_groq_json(system_prompt, idea_context)
+        if not result.get("is_relevant", True):  # default True so missing key doesn't drop valid results
+            return None
+        result["url"] = url
+        return result
+    except Exception as e:
+        print(f"Tier 1 extraction failed for {url}: {e}")
         return None
 
 
@@ -706,9 +797,17 @@ async def check_relevance_async(idea_text: str, parsed_idea: Dict[str, Any], con
 
 
 async def extract_competitor_profile_async(url: str, content: str) -> Optional[Dict[str, Any]]:
-    """Throttled async wrapper for competitor profile extraction."""
+    """Throttled async wrapper for competitor profile extraction (Tier 2)."""
     async with _groq_throttle:
         return await asyncio.to_thread(extract_competitor_profile, url, content)
+
+
+async def extract_competitor_profile_tier1_async(
+    url: str, content: str, idea_text: str, parsed_idea: Dict[str, Any]
+) -> Optional[Dict[str, Any]]:
+    """CHANGE 1: Throttled async wrapper for Tier 1 (named/listicle) extraction."""
+    async with _groq_throttle:
+        return await asyncio.to_thread(extract_competitor_profile_tier1, url, content, idea_text, parsed_idea)
 
 
 async def process_candidate(url: str, idea_text: str, parsed_idea: Dict[str, Any]) -> Dict[str, Any]:
@@ -766,169 +865,157 @@ async def process_listicle_followup(
     product_name: str, idea_text: str, parsed_idea: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
     """
-    Process a single listicle-mentioned product: search -> fetch -> classify+relevance (merged).
-    FIX 1: No outer semaphore. FIX 2: Returns unverified dict on API error. FIX 3.2: Merged call.
+    CHANGE 1 (Tier 1): Process a listicle-mentioned product.
+    Skips classify+relevance Groq call entirely. Instead:
+    1. Searches for the official site.
+    2. Checks domain blocklist (already handled inside fetch_jina_content_async).
+    3. Fetches via Jina.
+    4. Passes directly to Tier 1 extraction (relevance embedded in extraction prompt).
     """
-    print(f"  Searching for official site: {product_name}")
+    print(f"  [Tier1/Listicle] Searching for official site: {product_name}")
     followup_results = await search_competitors_async(f"{product_name} official website")
     if not followup_results:
         return None
 
-    top_result = followup_results[0]
-    fu_url = top_result.get("url", "")
-    fu_domain = extract_domain(fu_url)
+    # Try search results in order, skip blocked domains
+    for top_result in followup_results[:3]:
+        fu_url = top_result.get("url", "")
+        if not fu_url:
+            continue
 
-    fu_content = await fetch_jina_content_async(fu_url)
-    if fu_content is None:
-        print(f"    -> dead")
-        return None
+        # CHANGE 2: Blocklist check is inside fetch_jina_content_async, but log it here too
+        if is_blocked_domain(fu_url):
+            print(f"  [Tier1/Listicle] Skipping blocked domain for {product_name}: {fu_url}")
+            continue
 
-    try:
-        result = await classify_and_check_relevance_async(idea_text, parsed_idea, fu_content)
-    except Exception as e:
-        error_str = str(e)
-        if isinstance(e, HTTPException) or _is_rate_limit_error(error_str):
-            print(f"    -> API error, marking unverified: {error_str[:120]}")
+        fu_domain = extract_domain(fu_url)
+        fu_content = await fetch_jina_content_async(fu_url)
+        if fu_content is None:
+            print(f"  [Tier1/Listicle] Dead page for {product_name}: {fu_url}")
+            continue
+
+        # CHANGE 1: Rule-based short-content check (< 300 chars = dead)
+        if len(fu_content) < 300:
+            print(f"  [Tier1/Listicle] Content too short for {product_name}: {fu_url}")
+            continue
+
+        # Pass directly to Tier 1 extraction (no classify+relevance call)
+        try:
+            profile = await extract_competitor_profile_tier1_async(fu_url, fu_content, idea_text, parsed_idea)
+            if profile is None:
+                print(f"  [Tier1/Listicle] DROPPED by extraction (not relevant): {product_name} @ {fu_url}")
+                return None  # extraction said not relevant — don't try next URL
+            pname = profile.get("name") or product_name
+            print(f"  [Tier1/Listicle] ACCEPTED: {pname} @ {fu_url}")
             return {
-                "status": "unverified_api_error",
                 "url": fu_url,
                 "domain": fu_domain,
                 "content": fu_content,
-                "product_name": product_name,
+                "product_name": pname,
+                "_tier1_profile": profile,  # carry pre-extracted profile forward
             }
-        print(f"    -> classification error: {e}")
-        return None
+        except Exception as e:
+            print(f"  [Tier1/Listicle] Extraction error for {product_name} @ {fu_url}: {e}")
+            return None
 
-    page_type = result.get("page_type", "irrelevant")
-
-    if page_type != "product_homepage":
-        print(f"    -> not a product homepage ({page_type}), dropping")
-        return None
-
-    pname = result.get("product_name") or product_name
-    is_relevant = bool(result.get("is_relevant", False))
-    entity_type = result.get("entity_type", "other_non_product")
-    reason = result.get("relevance_reason", "")
-
-    if not is_relevant:
-        print(f"    -> DROPPED [{entity_type}]: {reason}")
-        return None
-
-    print(f"    -> RELEVANT [{entity_type}]: {reason}")
-    return {
-        "url": fu_url,
-        "domain": fu_domain,
-        "content": fu_content,
-        "product_name": pname,
-    }
+    print(f"  [Tier1/Listicle] No suitable URL found for {product_name}")
+    return None
 
 
 async def verify_named_competitor(name: str, idea_text: str, parsed_idea: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Verifies a specific named competitor from the likely_known_competitors list.
-    Steps: Search -> Fetch -> Relevance. Bypasses classification for named competitors.
-    FIX 1: Uses throttled check_relevance_async instead of outer semaphore.
+    CHANGE 1 (Tier 1): Verifies a specific named competitor from likely_known_competitors.
+    No classify+relevance Groq call. Path:
+      Search -> domain blocklist check -> Jina fetch -> short-content check
+      -> Tier 1 extraction (relevance embedded, one Groq call total per candidate).
     """
-    print(f"  [Verification] Starting verification for '{name}'")
-    # 1. Search (using name + 'software' for official website relevance)
+    print(f"  [Tier1/Named] Starting verification for '{name}'")
     try:
         query = f"{name} software"
         results = await search_competitors_async(query)
         if not results:
             reason = f"No search results returned for query '{query}'"
-            print(f"  [Verification] FAILED: '{name}' at search. Reason: {reason}")
+            print(f"  [Tier1/Named] FAILED: '{name}' at search. Reason: {reason}")
             return {"status": "failed", "name": name, "stage": "search", "reason": reason}
     except Exception as e:
         reason = f"Search failed with exception: {str(e)}"
-        print(f"  [Verification] FAILED: '{name}' at search. Reason: {reason}")
+        print(f"  [Tier1/Named] FAILED: '{name}' at search. Reason: {reason}")
         return {"status": "failed", "name": name, "stage": "search", "reason": reason}
 
-    blacklist_domains = [
-        "wikipedia.org", "youtube.com", "g2.com", "capterra.com", "play.google.com",
-        "apps.apple.com", "twitter.com", "facebook.com", "linkedin.com", "quora.com",
-        "reddit.com", "medium.com", "github.com", "crunchbase.com", "glassdoor.com",
-        "softonic.com", "uptodown.com"
-    ]
-
-    # Iterate through all search results to bypass common Wikipedia/Review sites
     last_failure = None
     for idx, r in enumerate(results):
         url = r.get("url", "")
-        print(f"  [Verification] Trying result {idx + 1} for '{name}': {url}")
+        print(f"  [Tier1/Named] Trying result {idx + 1} for '{name}': {url}")
 
-        url_lower = url.lower()
-        if any(dom in url_lower for dom in blacklist_domains):
+        # CHANGE 2: Use global BLOCKED_DOMAINS set (more comprehensive than old local list)
+        if is_blocked_domain(url):
             last_failure = {
-                "status": "failed",
-                "name": name,
-                "stage": "classify",
-                "reason": f"Skipped non-homepage URL: {url}",
-                "url": url
+                "status": "failed", "name": name, "stage": "classify",
+                "reason": f"Skipped blocked domain: {url}", "url": url
             }
+            print(f"  [Tier1/Named] Skipping blocked domain: {url}")
             continue
 
-        # 2. Fetch (throttled via _jina_throttle inside fetch_jina_content_async)
+        # Fetch (CHANGE 2: blocklist also checked inside, but skipped here since we already checked)
         try:
             content = await fetch_jina_content_async(url)
             if not content:
                 last_failure = {
-                    "status": "failed",
-                    "name": name,
-                    "stage": "fetch",
-                    "reason": f"Failed to fetch page content via Jina from URL: {url}",
-                    "url": url
+                    "status": "failed", "name": name, "stage": "fetch",
+                    "reason": f"Failed to fetch page content via Jina from URL: {url}", "url": url
                 }
                 continue
         except Exception as e:
             last_failure = {
-                "status": "failed",
-                "name": name,
-                "stage": "fetch",
-                "reason": f"Fetch failed with exception: {str(e)} from URL: {url}",
-                "url": url
+                "status": "failed", "name": name, "stage": "fetch",
+                "reason": f"Fetch failed: {str(e)} from URL: {url}", "url": url
             }
             continue
 
-        # 3. Relevance (throttled via check_relevance_async)
+        # CHANGE 1: Rule-based short-content check (< 300 chars = dead, no Groq)
+        if len(content) < 300:
+            last_failure = {
+                "status": "failed", "name": name, "stage": "fetch",
+                "reason": f"Content too short ({len(content)} chars): {url}", "url": url
+            }
+            print(f"  [Tier1/Named] Content too short for '{name}' at {url}")
+            continue
+
+        # CHANGE 1: Skip classify+relevance — go straight to Tier 1 extraction
         try:
-            rel = await check_relevance_async(idea_text, parsed_idea, content)
-            if not rel["is_relevant"]:
+            profile = await extract_competitor_profile_tier1_async(url, content, idea_text, parsed_idea)
+            if profile is None:
+                # Extraction decided it's not relevant
                 last_failure = {
-                    "status": "failed",
-                    "name": name,
-                    "stage": "relevance",
-                    "reason": f"Relevance check failed: {rel.get('relevance_reason', 'No reason given')}",
-                    "url": url
+                    "status": "failed", "name": name, "stage": "relevance",
+                    "reason": f"Tier 1 extraction: product not relevant to idea from URL: {url}", "url": url
                 }
-                continue
+                print(f"  [Tier1/Named] DROPPED by extraction (not relevant): '{name}' @ {url}")
+                # Don't try more URLs if the found page is clearly the product but not relevant
+                break
+            pname = profile.get("name") or name
+            print(f"  [Tier1/Named] SUCCESS: '{name}' verified as '{pname}' at {url}")
+            return {
+                "status": "success",
+                "name": name,
+                "product_name": pname,
+                "url": url,
+                "content": content,
+                "_tier1_profile": profile,  # carry pre-extracted profile to skip Agent 3
+            }
         except Exception as e:
             last_failure = {
-                "status": "failed",
-                "name": name,
-                "stage": "relevance",
-                "reason": f"Relevance check failed with exception: {str(e)}",
-                "url": url
+                "status": "failed", "name": name, "stage": "relevance",
+                "reason": f"Tier 1 extraction exception: {str(e)} from URL: {url}", "url": url
             }
             continue
 
-        # If it reached here, it succeeded!
-        print(f"  [Verification] SUCCESS: '{name}' verified successfully at {url}")
-        return {
-            "status": "success",
-            "name": name,
-            "product_name": name,
-            "url": url,
-            "content": content
-        }
-
-    # If all results in loop failed
     if last_failure:
-        print(f"  [Verification] FAILED: All candidate URLs failed verification for '{name}'. Last failure: {last_failure['reason']}")
+        print(f"  [Tier1/Named] FAILED: All candidate URLs failed for '{name}'. Last: {last_failure['reason']}")
         return last_failure
-    else:
-        reason = f"No suitable homepage URL found in search results for '{name}'"
-        print(f"  [Verification] FAILED: '{name}'. Reason: {reason}")
-        return {"status": "failed", "name": name, "stage": "classify", "reason": reason}
+    reason = f"No suitable homepage URL found in search results for '{name}'"
+    print(f"  [Tier1/Named] FAILED: '{name}'. Reason: {reason}")
+    return {"status": "failed", "name": name, "stage": "classify", "reason": reason}
 
 
 # =====================================================================
@@ -961,14 +1048,16 @@ async def run_analysis(idea_text: str, progress_callback=None) -> Dict[str, Any]
         "- target_users (string)\n"
         "- key_features (array of 5 strings)\n"
         "- unique_angle (string)\n"
-        "- likely_known_competitors: array of up to 5 REAL product names you already know of "
-        "that solve a similar problem (empty array if genuinely none come to mind -- do not invent names). "
+        "- likely_known_competitors: array of up to 3 REAL product names you already know of "
+        "that solve a similar problem (maximum 3, empty array if genuinely none come to mind -- do not invent names). "
         "These will be directly verified via web search, so accuracy matters -- only include names "
         "you are confident are real products.\n"
-        "- industry_terms: array of 3-5 alternate phrasings a professional in this exact industry "
-        "would use to describe the idea's core function, avoiding the user's literal wording where "
-        "the user may have used a layperson or non-standard term (e.g. if the user says 'CCTV cameras' "
-        "but the industry says 'proximal sensors' or 'machine vision cameras,' include the industry term)\n"
+        "- industry_terms: array of 3-5 terms. CHANGE 3: Use the specific vocabulary that professionals "
+        "and products in this domain actually use in their marketing and product descriptions -- not the "
+        "user's layperson phrasing. For example, if the user says 'AI documentation from code comments,' "
+        "the industry terms might be 'docs-as-code,' 'OpenAPI generator,' 'developer portal,' "
+        "'API reference automation.' Always include at least one term that a product in this space "
+        "would use on their own homepage.\n"
         "- search_queries: array of 4 distinct search query strings designed to find REAL competing "
         "products. Include at least one query using a known competitor name (e.g. 'alternatives to "
         "Grammarly for business email tone'), one category-based query, and one feature-specific query. "
@@ -983,7 +1072,7 @@ async def run_analysis(idea_text: str, progress_callback=None) -> Dict[str, Any]
 
     # FIX 6: Granular progress after Agent 1
     n_features = len(parsed_idea.get('key_features', []))
-    likely_known = parsed_idea.get("likely_known_competitors", [])
+    likely_known = parsed_idea.get("likely_known_competitors", [])[:3]  # hard cap at 3
     await emit(0, "Idea parsed", f"{n_features} features, {len(likely_known)} named competitors identified")
 
     # =========================================================================
@@ -999,13 +1088,8 @@ async def run_analysis(idea_text: str, progress_callback=None) -> Dict[str, Any]
         )
         search_queries = [fallback_query]
 
-    # Fix A.3: Generate industry-term alternate queries
-    if industry_terms:
-        domain = parsed_idea.get("domain", "")
-        for term in industry_terms[:2]:
-            alt_query = f"{term} software tools {domain} competitors"
-            search_queries.append(alt_query)
-            print(f"  Added industry-term query: {alt_query}")
+    # Industry-term queries intentionally removed to reduce downstream Groq call count.
+    # Agent 1's 4 hand-crafted queries are already specific enough.
 
     total_queries = len(search_queries)
     print(f"  Running verification for {len(likely_known)} named competitors and {total_queries} general search queries.")
@@ -1079,13 +1163,14 @@ async def run_analysis(idea_text: str, progress_callback=None) -> Dict[str, Any]
                 seen_domains.add(domain)
                 all_results.append(r)
 
-    # FIX 3.3: Hard cap at MAX_CANDIDATES (now 10)
+    # CHANGE 1: Hard cap at MAX_CANDIDATES (5) for Tier 2 general search URLs
     if len(all_results) > MAX_CANDIDATES:
-        print(f"  Capping general candidates from {len(all_results)} to {MAX_CANDIDATES}")
+        print(f"  Capping Tier 2 general candidates from {len(all_results)} to {MAX_CANDIDATES}")
         all_results = all_results[:MAX_CANDIDATES]
 
     print(
-        f"Agent 2: {len(all_results)} unique candidate URLs after deduplication "
+        f"Agent 2: {len(all_results)} Tier 2 candidate URLs (general search), "
+        f"{len(product_homepages)} Tier 1 named competitors already verified, "
         f"across {total_queries} queries."
     )
 
@@ -1093,12 +1178,14 @@ async def run_analysis(idea_text: str, progress_callback=None) -> Dict[str, Any]
     await emit(1, "Search complete", f"{len(all_results)} candidate URLs found, {len(product_homepages)} named verified")
 
     # =========================================================================
-    # Source Classifier -- parallel processing (FIX 3.2: merged call)
+    # CHANGE 1: Tier 2 Source Classifier — general search URLs only
+    # Named/listicle candidates are Tier 1 and use extract_competitor_profile_tier1 directly.
     # =========================================================================
-    await emit(2, "Classifying sources...", f"Processing {len(all_results)} candidates")
-    print("Running Source Classifier...")
+    await emit(2, "Classifying sources...", f"Processing {len(all_results)} Tier 2 candidates")
+    print("Running Tier 2 Source Classifier (classify+relevance for general search URLs)...")
 
-    # Phase 1: Process all candidates in parallel (fetch -> merged classify+relevance)
+    # Phase 1: Process Tier 2 (general search) candidates in parallel
+    # These still use the full classify+relevance Groq call (unknown URLs).
     candidate_tasks = []
     for result in all_results:
         url = result.get("url", "")
@@ -1107,8 +1194,8 @@ async def run_analysis(idea_text: str, progress_callback=None) -> Dict[str, Any]
 
     phase1_results = await asyncio.gather(*candidate_tasks, return_exceptions=True)
 
-    listicle_mention_counts = Counter()  # FIX 3.1: count frequency for capping
-    retry_queue = []                     # FIX 2: collect unverified candidates
+    listicle_mention_counts = Counter()  # count frequency for capping
+    retry_queue = []                     # collect unverified candidates for retry
 
     for result in phase1_results:
         if isinstance(result, Exception):
@@ -1129,32 +1216,29 @@ async def run_analysis(idea_text: str, progress_callback=None) -> Dict[str, Any]
                 if name and name.lower().strip() not in covered_product_names:
                     listicle_mention_counts[name.strip()] += 1
         elif result["status"] == "unverified_api_error":
-            # FIX 2: save for retry
             retry_queue.append(result)
 
-    # FIX 6: Granular progress after Phase 1
     n_relevant = sum(1 for r in phase1_results if not isinstance(r, Exception) and r.get("status") == "relevant")
     n_unverified = len(retry_queue)
-    await emit(2, "Phase 1 classified", f"{n_relevant} relevant, {n_unverified} pending retry")
+    await emit(2, "Tier 2 classified", f"{n_relevant} relevant from general search, {n_unverified} pending retry")
 
-    # Phase 2: Follow up on listicle-mentioned products not already covered (parallel)
-    # FIX 3.1: Sort by frequency descending, cap at 10
+    # Phase 2 (Tier 1): Follow up on listicle-mentioned products — NO classify+relevance Groq call
+    # CHANGE 1: process_listicle_followup now uses Tier 1 extraction path.
     to_followup = sorted(
         listicle_mention_counts.keys(),
         key=lambda n: (-listicle_mention_counts[n], n.lower())
     )
-    # Filter out products already covered
     to_followup = [
         name for name in to_followup
         if name.lower().strip() not in covered_product_names
-    ][:10]  # FIX 3.1: cap at 10
+    ][:8]  # cap at 8 (Tier 1 is cheaper — no separate classify+relevance call)
 
     if to_followup:
         print(
-            f"Source Classifier Phase 2: Following up on "
-            f"{len(to_followup)} listicle-mentioned products (capped at 10)..."
+            f"Tier 1 Phase 2: Following up on "
+            f"{len(to_followup)} listicle-mentioned products (Tier 1, capped at 8)..."
         )
-        await emit(2, "Following up listicle mentions...", f"{len(to_followup)} names to check")
+        await emit(2, "Following up listicle mentions...", f"{len(to_followup)} Tier 1 names to check")
 
         followup_tasks = [
             process_listicle_followup(name, idea_text, parsed_idea)
@@ -1168,10 +1252,7 @@ async def run_analysis(idea_text: str, progress_callback=None) -> Dict[str, Any]
                 continue
             if result is None:
                 continue
-            # FIX 2: check for unverified_api_error from listicle followup
-            if isinstance(result, dict) and result.get("status") == "unverified_api_error":
-                retry_queue.append(result)
-                continue
+            # Tier 1 followup does not produce unverified_api_error (extraction handles errors internally)
             # Deduplicate by domain after parallel gathering
             if result.get("domain") and result["domain"] not in seen_domains:
                 seen_domains.add(result["domain"])
@@ -1181,6 +1262,7 @@ async def run_analysis(idea_text: str, progress_callback=None) -> Dict[str, Any]
                         "url": result["url"],
                         "content": result["content"],
                         "product_name": pname,
+                        "_tier1_profile": result.get("_tier1_profile"),  # carry pre-extracted profile
                     })
                     covered_product_names.add(pname.lower().strip())
 
@@ -1238,27 +1320,45 @@ async def run_analysis(idea_text: str, progress_callback=None) -> Dict[str, Any]
 
     # =========================================================================
     # AGENT 3: Competitor Intelligence -- parallel extraction
+    # CHANGE 1: Tier 1 candidates carry a pre-extracted profile (_tier1_profile).
+    # Re-use it directly; only run extraction for Tier 2 candidates (no _tier1_profile).
     # =========================================================================
+    tier1_with_profile = [hp for hp in product_homepages if hp.get("_tier1_profile")]
+    tier2_need_extraction = [hp for hp in product_homepages if not hp.get("_tier1_profile")]
+
     await emit(
         3, "Analyzing competitor products...",
-        f"Extracting {len(product_homepages)} profiles"
+        f"{len(tier1_with_profile)} Tier 1 profiles ready, extracting {len(tier2_need_extraction)} Tier 2"
     )
-    print("Running Agent 3: Competitor Intelligence (grounded extraction)...")
+    print(
+        f"Running Agent 3: {len(tier1_with_profile)} Tier 1 profiles reused, "
+        f"{len(tier2_need_extraction)} Tier 2 profiles to extract..."
+    )
 
     extraction_tasks = [
         extract_competitor_profile_async(hp["url"], hp["content"])
-        for hp in product_homepages
+        for hp in tier2_need_extraction
     ]
     extraction_results = await asyncio.gather(*extraction_tasks, return_exceptions=True)
 
     competitors = []
+
+    # Add Tier 1 pre-extracted profiles directly
+    for hp in tier1_with_profile:
+        profile = hp["_tier1_profile"]
+        # Ensure url field is present
+        profile.setdefault("url", hp["url"])
+        competitors.append(profile)
+        print(f"  [Tier1] Reused profile: {profile.get('name', hp.get('product_name', 'Unknown'))}")
+
+    # Add Tier 2 freshly extracted profiles
     for i, result in enumerate(extraction_results):
         if isinstance(result, Exception):
-            print(f"  Extraction error for {product_homepages[i]['url']}: {result}")
+            print(f"  Extraction error for {tier2_need_extraction[i]['url']}: {result}")
             continue
         if result is not None:
             competitors.append(result)
-            print(f"  Extracted profile: {result.get('name', 'Unknown')}")
+            print(f"  [Tier2] Extracted profile: {result.get('name', 'Unknown')}")
 
     print(f"Agent 3 complete: {len(competitors)} competitor profiles extracted.")
 
