@@ -1,158 +1,174 @@
-# IdeaLens — AI-Powered Idea Validation & Competitive Intelligence Platform
+# IdeaLens
 
-IdeaLens is a full-stack AI web application that helps creators, startup founders, and developers validate their business concepts before writing code. A user inputs their startup idea, and an autonomous 4-Agent pipeline performs structured extraction, web search discovery, product copies analysis, and strategic positioning to produce a highly visual, dark-themed competitive dashboard.
+**AI-powered startup idea validation and competitive intelligence platform.**
 
-## System Architecture
-
-```
-                       +---------------------------------------+
-                       |              User Input               |
-                       +---------------------------------------+
-                                           |
-                                           v
-                       +---------------------------------------+
-                       |        AGENT 1: Idea Parser           |
-                       | (Extracts problem, solution, domain)  |
-                       +---------------------------------------+
-                                           |
-                                           v
-                       +---------------------------------------+
-                       |      AGENT 2: Search & Discovery      |
-                       |   (Finds competitors via Tavily API)  |
-                       +---------------------------------------+
-                                           |
-                                           v
-                       +---------------------------------------+
-                       |    AGENT 3: Competitor Intelligence    |
-                       |   (Parses copy via Jina & Grok API)   |
-                       +---------------------------------------+
-                                           |
-                                           v
-                       +---------------------------------------+
-                       |        AGENT 4: Strategy Agent        |
-                       |  (Generates matrices, scores, advice) |
-                       +---------------------------------------+
-                                           |
-                                           v
-                       +---------------------------------------+
-                       |          Frontend Dashboard           |
-                       |  (Interactive Radar, matrix, scores)  |
-                       +---------------------------------------+
-```
+IdeaLens takes a startup idea as input and runs it through a 4-agent pipeline that searches the live web, discovers real competitors, extracts grounded product intelligence, and generates an interactive strategy dashboard — all in real time.
 
 ---
 
-## Folder Structure
+## What It Does
+
+Enter any startup idea in plain text. IdeaLens:
+
+1. **Parses** your idea into structured business signals
+2. **Discovers** real competing products via live web search
+3. **Verifies** each result is an actual product homepage (not a blog, listicle, or review aggregator)
+4. **Extracts** grounded competitor profiles from scraped content
+5. **Generates** a visual strategy dashboard with:
+   - Competitor cards with real URLs and sourced feature lists
+   - Radar chart comparing your idea against top competitors
+   - Feature gap matrix highlighting differentiation opportunities
+   - Idea scoring across Innovation, Market Gap, Feasibility, and Competition Density
+   - Prioritized differentiation recommendations
+
+---
+
+## Agent Pipeline Architecture
 
 ```
-/idealens
-  ├── /backend
-  │    ├── main.py              # FastAPI server with 4-agent workflow
-  │    ├── requirements.txt     # Python package dependencies
-  │    └── .env.example         # Example backend environment configuration
-  │
-  ├── /frontend
-  │    ├── /pages
-  │    │    └── index.js        # Main React dashboard layout and UI logic
-  │    ├── /styles
-  │    │    └── globals.css     # Dark theme CSS variable stylesheet
-  │    ├── package.json         # Node.js configurations and dependencies
-  │    └── .env.local           # Local frontend environment file
-  │
-  └── README.md                 # Project guide
+User Idea Input
+      ↓
+[Agent 1] Idea Parser
+  → Extracts: problem, solution, domain, target users,
+    key features, unique angle, likely competitors,
+    industry search terms
+      ↓
+[Agent 2] Search & Discovery
+  → Tier 1: Verifies named competitors directly
+  → Tier 2: Runs targeted search queries via Tavily
+  → Listicle Mining: Extracts product names from
+    comparison articles, verifies each one
+  → Domain blocklist filters noise (Wikipedia, YouTube,
+    Reddit, LinkedIn, etc.)
+      ↓
+[Agent 3] Competitor Intelligence
+  → Fetches each verified product page via Jina Reader
+  → Extracts grounded profiles: features, pricing,
+    strengths, weaknesses — all sourced from page text
+  → "Not stated on website" instead of invented values
+  → Evidence snippets stored for source verification
+      ↓
+[Agent 4] Strategy Agent
+  → Feature matrix comparing idea vs all competitors
+  → Idea scores (0–100) across 4 dimensions
+  → 5 prioritized differentiation recommendations
+  → Executive summary grounded in verified competitor data
+      ↓
+Visual Dashboard
 ```
 
 ---
 
-## Prerequisites
+## Tech Stack
 
-- **Python**: v3.9 or higher
-- **Node.js**: v18.0.0 or higher & **npm**
-
----
-
-## Installation & Local Setup
-
-### 1. Backend Setup (FastAPI)
-
-1. Open your terminal and navigate to the backend directory:
-   ```bash
-   cd backend
-   ```
-2. Create a Python virtual environment and activate it:
-   ```bash
-   python -m venv venv
-   # On Windows:
-   .\venv\Scripts\activate
-   # On macOS/Linux:
-   source venv/bin/activate
-   ```
-3. Install the required dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-4. Copy the environment template and fill in your API keys:
-   ```bash
-   copy .env.example .env
-   # or
-   cp .env.example .env
-   ```
-5. Edit `.env` to include your actual API keys:
-   ```env
-   GROK_API_KEY=your_xai_key_here
-   TAVILY_API_KEY=your_tavily_key_here
-   ```
-6. Start the FastAPI development server:
-   ```bash
-   python main.py
-   ```
-   The backend server will run on `http://localhost:8000`.
-
-### 2. Frontend Setup (Next.js)
-
-1. In a new terminal window, navigate to the frontend directory:
-   ```bash
-   cd frontend
-   ```
-2. Install the frontend package dependencies:
-   ```bash
-   npm install
-   ```
-3. The `.env.local` file is already created, pointing to the local API:
-   ```env
-   NEXT_PUBLIC_API_URL=http://localhost:8000
-   ```
-4. Run the development server:
-   ```bash
-   npm run dev
-   ```
-   Open your browser and navigate to `http://localhost:3000` to see the live application.
+| Layer | Technology |
+|---|---|
+| Backend | FastAPI (Python) |
+| Frontend | Next.js + Tailwind CSS |
+| LLM | Groq (Llama 3.3 70B) |
+| Web Search | Tavily API |
+| Web Extraction | Jina Reader API |
+| Charts | Recharts |
+| Icons | Lucide React |
 
 ---
 
-## Deployment Guide
+## Getting Started
 
-### Deploying the Backend (Render)
+### Prerequisites
 
-1. Sign up/Log in to [Render](https://render.com/).
-2. Create a new **Web Service** and connect it to your GitHub repository containing the backend code.
-3. Configure the service settings:
-   - **Environment**: `Python`
-   - **Root Directory**: `backend`
-   - **Build Command**: `pip install -r requirements.txt`
-   - **Start Command**: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-4. Add the following **Environment Variables** in the Render settings:
-   - `GROK_API_KEY`: *(your secret xAI key)*
-   - `TAVILY_API_KEY`: *(your secret Tavily key)*
-5. Click **Deploy Web Service**. Render will build and deploy the backend container. Keep track of the generated live URL (e.g. `https://idealens-backend.onrender.com`).
+- Python 3.10+
+- Node.js 18+
+- API keys for Groq, Tavily, and Jina Reader (all free tier)
 
-### Deploying the Frontend (Vercel)
+### Backend Setup
 
-1. Sign up/Log in to [Vercel](https://vercel.com/).
-2. Create a new project and import your repository.
-3. Configure the build parameters:
-   - **Framework Preset**: `Next.js`
-   - **Root Directory**: `frontend`
-4. Add the following **Environment Variables** in Vercel settings:
-   - `NEXT_PUBLIC_API_URL`: `https://your-backend-render-url.onrender.com` (use your deployed Render backend URL)
-5. Click **Deploy**. Vercel will build, optimize, and serve your Next.js application globally.
+```bash
+cd backend
+python -m venv venv
+
+# Windows:
+venv\Scripts\activate
+# macOS/Linux:
+source venv/bin/activate
+
+pip install -r requirements.txt
+cp .env.example .env
+# Add your API keys to .env
+python main.py
+```
+
+Backend runs at `http://localhost:8000`
+
+### Frontend Setup
+
+```bash
+cd frontend
+npm install
+# Add NEXT_PUBLIC_API_URL=http://localhost:8000 to .env.local
+npm run dev
+```
+
+Frontend runs at `http://localhost:3000`
+
+---
+
+## API Keys
+
+| Key | Where to Get | Cost |
+|---|---|---|
+| `GROQ_API_KEY` | [console.groq.com](https://console.groq.com) | Free tier |
+| `TAVILY_API_KEY` | [app.tavily.com](https://app.tavily.com) | Free tier (1000 searches/mo) |
+| `JINA_API_KEY` | [jina.ai/reader](https://jina.ai/reader) | Free tier |
+
+---
+
+## Project Structure
+
+```
+idealens/
+├── backend/
+│   ├── main.py              # FastAPI app + 4-agent pipeline
+│   ├── requirements.txt     # Python dependencies
+│   ├── .env.example         # Environment variable template
+│   └── test_regression.py   # Pipeline regression tests
+├── frontend/
+│   ├── pages/
+│   │   ├── index.js         # Main dashboard UI
+│   │   ├── _app.js          # Next.js app wrapper
+│   │   └── _document.js     # Next.js document config
+│   ├── styles/
+│   │   └── globals.css      # Global styles
+│   ├── public/
+│   │   └── favicon.ico
+│   └── package.json
+└── README.md
+```
+
+---
+
+## Key Design Decisions
+
+**Zero hallucination standard** — every fact shown in a competitor card is extracted from scraped page content. Fields that cannot be sourced from the page display "Not stated on website" rather than an invented value. Each card includes a "Verify sources" section showing the exact text snippet used for each extracted field.
+
+**Source classification before extraction** — the pipeline classifies every URL as a product homepage, listicle, or irrelevant page before running expensive extraction. Listicles are mined for product names and used as discovery signals rather than competitor profiles.
+
+**Domain blocklist** — Wikipedia, YouTube, Reddit, LinkedIn, app stores, and review aggregators are skipped before any fetch or LLM call, preserving API quota for real product pages.
+
+**Rate limit resilience** — Jina Reader requests are limited to 2 concurrent with 500ms stagger. Groq calls use a 3-slot semaphore with exponential backoff on 429 responses.
+
+---
+
+## Limitations
+
+- Results depend on Groq's free-tier daily token quota. Heavy usage (5+ analyses/day) may trigger rate limiting.
+- Some product websites block web scrapers (403/401 responses). Affected competitors are skipped and logged in Pipeline Diagnostics.
+- The pipeline targets English-language products and queries.
+
+---
+
+## Built By
+
+**Appala Vaishnav Reddy**  
+B.Tech Computer Science, Parul Institute of Engineering and Technology  
+[github.com/vaishnav-reddy](https://github.com/vaishnav-reddy)

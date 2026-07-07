@@ -1,15 +1,27 @@
-.env
+# Dependencies
 node_modules/
-dist/  
-coverage/
-logs/   
-*.log
-.DS_Store   
+frontend/node_modules/
+
+# Python
+backend/venv/
+backend/Venv/
+**/__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables (never commit these)
+.env
+.env.local
+backend/.env
+frontend/.env.local
+
+# Next.js build output
+frontend/.next/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
 .vscode/
 .idea/
-*.iml
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
- 
