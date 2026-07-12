@@ -167,8 +167,4 @@ idealens/
 
 ---
 
-## Built By
-
-**Appala Vaishnav Reddy**  
-B.Tech Computer Science, Parul Institute of Engineering and Technology  
-[github.com/vaishnav-reddy](https://github.com/vaishnav-reddy)
+ 
